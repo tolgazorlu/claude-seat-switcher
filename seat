@@ -1,0 +1,1144 @@
+#!/usr/bin/env python3
+"""seat — pick which Claude account (seat) Claude Code and Hermes use, per terminal
+and per project, with live limit bars and an offer to continue on another seat when
+one hits its limit.
+
+stdlib only, Python 3.9+ (macOS system python). Secrets are never printed: tokens are
+read only to ask api.anthropic.com about usage/identity, and are never refreshed here
+(refresh tokens are single-use; refreshing behind Claude Code's back would log it out).
+
+Ideas (no code) borrowed from: uwuclxdy/clauth (MIT) usage bars + fallback chain,
+Nemo-Illusionist/claude-code-account-switcher (MIT) directory binding,
+inulute/cux (GPL-3.0) per-project seat pools and resume-after-switch.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "0.3.0"
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("SEAT_CONFIG_DIR", HOME / ".config" / "seat"))
+CONFIG = CONFIG_DIR / "config.json"
+CACHE_DIR = Path(os.environ.get("SEAT_CACHE_DIR", HOME / ".cache" / "seat"))
+HERMES_ROOT = Path(os.environ.get("SEAT_HERMES_ROOT", HOME / ".hermes"))
+DEFAULT_CLAUDE_DIR = HOME / ".claude"
+LEGACY_TSV = HOME / ".config" / "ccs" / "accounts.tsv"
+OFFLINE = os.environ.get("SEAT_OFFLINE") == "1"   # tests: never touch the network
+SHARED_CLAUDE_ITEMS = ["CLAUDE.md", "settings.json", "commands", "agents", "skills", "hooks", "plugins", "output-styles"]
+PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "icloud.com", "me.com", "outlook.com", "hotmail.com",
+                    "live.com", "yahoo.com", "proton.me", "protonmail.com", "yandex.com"}
+LIMIT_PCT = 99.0     # at/above: treated as limited
+WARN_PCT = 90.0      # at/above: warn on launch
+USAGE_TTL = 90       # seconds a cached usage reading is considered fresh
+LIMIT_TEXT = re.compile(r"usage limit|hit your limit|rate[ _-]?limit|limit reached", re.I)
+
+
+# ── small utils ──────────────────────────────────────────────────────────────
+def die(msg, code=1):
+    sys.stderr.write(f"seat: {msg}\n")
+    sys.exit(code)
+
+
+def tty_write(text):
+    """Write to the controlling terminal (stdout may be captured by the shell)."""
+    try:
+        with open("/dev/tty", "w") as t:
+            t.write(text)
+    except OSError:
+        sys.stderr.write(text)
+
+
+def color(s, code):
+    return s if os.environ.get("NO_COLOR") else f"\033[{code}m{s}\033[0m"
+
+
+def write_private(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def now():
+    return time.time()
+
+
+def slug(path):
+    """Claude Code's per-project folder name under <config>/projects/."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(path))
+
+
+def group_for(email):
+    domain = (email or "").rsplit("@", 1)[-1].lower()
+    if not domain or domain in PERSONAL_DOMAINS:
+        return "personal"
+    return re.sub(r"[^a-z0-9]", "", domain.split(".")[0]) or "work"
+
+
+def fmt_reset(epoch):
+    if not epoch:
+        return ""
+    left = epoch - now()
+    if left <= 0:
+        return "şimdi"
+    h, m = int(left // 3600), int(left % 3600 // 60)
+    when = datetime.fromtimestamp(epoch).strftime("%H:%M" if left < 86400 else "%d.%m %H:%M")
+    return f"{when} ({h}s {m}dk)" if h else f"{when} ({m}dk)"
+
+
+def bar(pct, width=8):
+    if pct is None:
+        return color("·" * width, "2") + "   ?"
+    filled = max(0, min(width, int(round(pct / 100 * width))))
+    code = "32" if pct < 70 else ("33" if pct < WARN_PCT else "31")
+    return color("█" * filled, code) + color("░" * (width - filled), "2") + f" {pct:3.0f}%"
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+class Account:
+    def __init__(self, d):
+        self.name = d["name"]
+        self.email = d.get("email", "")
+        self.group = d.get("group") or group_for(self.email)
+        self.claude_dir = Path(os.path.expanduser(d["claude_dir"]))
+        self.hermes_profile = d.get("hermes_profile", self.name)
+        self.isolated = bool(d.get("isolated", False))
+
+    def to_dict(self):
+        return {"name": self.name, "email": self.email, "group": self.group,
+                "claude_dir": str(self.claude_dir).replace(str(HOME), "~", 1),
+                "hermes_profile": self.hermes_profile, "isolated": self.isolated}
+
+    @property
+    def is_default(self):
+        return self.hermes_profile == "default"
+
+    @property
+    def hermes_home(self):
+        return HERMES_ROOT if self.is_default else HERMES_ROOT / "profiles" / self.hermes_profile
+
+    def env(self):
+        """Environment for this seat. Default seat: CLAUDE_CONFIG_DIR must stay UNSET —
+        Claude Code keys its Keychain item on it, so even ~/.claude would log it out."""
+        if self.is_default:
+            return {"SEAT_ACCOUNT": self.name, "CLAUDE_CONFIG_DIR": None, "HERMES_HOME": None}
+        return {"SEAT_ACCOUNT": self.name, "CLAUDE_CONFIG_DIR": str(self.claude_dir),
+                "HERMES_HOME": str(self.hermes_home)}
+
+    def env_script(self):
+        parts, unset = [], []
+        for k, v in self.env().items():
+            if v is None:
+                unset.append(k)
+            else:
+                parts.append(f"{k}={shlex.quote(v)}")
+        out = []
+        if unset:
+            out.append("unset " + " ".join(unset))
+        out.append("export " + " ".join(parts))
+        return "; ".join(out)
+
+    def proc_env(self):
+        e = dict(os.environ)
+        for k, v in self.env().items():
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = v
+        return e
+
+    def label(self):
+        return f"{self.name} <{self.email}>" if self.email else self.name
+
+
+class Config:
+    def __init__(self):
+        data = read_json(CONFIG)
+        if data is None:
+            data = self._bootstrap()
+        self.accounts = [Account(a) for a in data.get("accounts", [])]
+        self.projects = data.get("projects", [])
+        self.settings = data.get("settings", {})
+
+    @staticmethod
+    def _bootstrap():
+        accounts = []
+        if LEGACY_TSV.exists():   # migrate from ccs v0.2
+            for line in LEGACY_TSV.read_text().splitlines():
+                cols = (line.split("\t") + ["", "", "", ""])[:4]
+                if cols[0]:
+                    accounts.append({"name": cols[0], "claude_dir": cols[1], "hermes_profile": cols[2],
+                                     "email": cols[3], "group": group_for(cols[3])})
+        if not any(a["hermes_profile"] == "default" for a in accounts):
+            accounts.insert(0, {"name": "default", "claude_dir": "~/.claude", "hermes_profile": "default",
+                                "email": "", "group": "personal"})
+        data = {"version": 1, "accounts": accounts, "projects": [], "settings": {}}
+        write_private(CONFIG, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        return data
+
+    def save(self):
+        data = {"version": 1, "accounts": [a.to_dict() for a in self.accounts],
+                "projects": self.projects, "settings": self.settings}
+        write_private(CONFIG, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    def get(self, name):
+        for a in self.accounts:
+            if a.name == name:
+                return a
+        return None
+
+    def need(self, name):
+        a = self.get(name)
+        if not a:
+            die(f"'{name}' diye bir hesap yok. Kayıtlı: {', '.join(x.name for x in self.accounts)}")
+        return a
+
+    @property
+    def default(self):
+        return next(a for a in self.accounts if a.is_default)
+
+    def current(self):
+        name = os.environ.get("SEAT_ACCOUNT") or os.environ.get("CCS_ACCOUNT")
+        if name and self.get(name):
+            return self.get(name)
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        if cfg:
+            for a in self.accounts:
+                if not a.is_default and str(a.claude_dir) == str(Path(cfg).expanduser()):
+                    return a
+        return self.default
+
+    def rule_for(self, cwd):
+        """Longest path-boundary match among project rules, or None."""
+        cwd = str(Path(cwd).resolve())
+        best = None
+        for r in self.projects:
+            p = r["path"].rstrip("/")
+            if cwd == p or cwd.startswith(p + "/"):
+                if best is None or len(p) > len(best["path"]):
+                    best = r
+        return best
+
+    def allowed(self, cwd, current):
+        """Seats a terminal in *cwd* may use automatically: the project's list, else the
+        current seat's group (a personal project never spills onto a company seat)."""
+        rule = self.rule_for(cwd)
+        if rule:
+            return [a for a in (self.get(n) for n in rule["accounts"]) if a]
+        return [a for a in self.accounts if a.group == current.group]
+
+
+# ── login state (cheap, local) ───────────────────────────────────────────────
+def hermes_rows(acc):
+    data = read_json(acc.hermes_home / "auth.json", {}) or {}
+    return (data.get("credential_pool") or {}).get("anthropic") or []
+
+
+def hermes_adopts(acc):
+    try:
+        cfg = (acc.hermes_home / "config.yaml").read_text()
+    except OSError:
+        return True
+    m = re.search(r"^\s*adopt_external_logins:\s*(\S+)", cfg, re.M)
+    return not (m and m.group(1).lower() in ("false", "no", "off"))
+
+
+def hermes_ready(acc):
+    """True if Hermes on this seat would use this seat's own login. A non-default profile
+    with no Anthropic rows reads the root pool = the default seat's limits."""
+    rows = hermes_rows(acc)
+    if acc.is_default:
+        return bool(rows) or (DEFAULT_CLAUDE_DIR / ".credentials.json").exists()
+    return (not hermes_adopts(acc)) and any(r.get("source") != "claude_code" for r in rows)
+
+
+def claude_ready(acc):
+    data = read_json(acc.claude_dir / ".claude.json" if not acc.is_default else HOME / ".claude.json", {}) or {}
+    return bool((data.get("oauthAccount") or {}).get("emailAddress"))
+
+
+def ready(acc, tool):
+    return hermes_ready(acc) if tool == "hermes" else claude_ready(acc)
+
+
+def claude_auth_status(acc):
+    try:
+        out = subprocess.run(["claude", "auth", "status"], env=acc.proc_env(), capture_output=True,
+                             text=True, timeout=20).stdout
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+# ── tokens + Anthropic API (read-only, never refreshed) ──────────────────────
+def valid_tokens(acc):
+    toks = []
+    for r in hermes_rows(acc):
+        if r.get("source") != "claude_code" and r.get("access_token") and \
+                (r.get("expires_at_ms") or 0) > now() * 1000 + 60_000:
+            toks.append(r["access_token"])
+    cred = read_json(acc.claude_dir / ".credentials.json", {}) or {}
+    c = cred.get("claudeAiOauth") or {}
+    if c.get("accessToken") and c.get("expiresAt", 0) > now() * 1000 + 60_000:
+        toks.append(c["accessToken"])
+    return toks
+
+
+def api_get(path, token, timeout=4.0):
+    req = urllib.request.Request("https://api.anthropic.com" + path, headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json", "User-Agent": f"seat/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def identity(acc, token=None):
+    if OFFLINE:
+        return None
+    for tok in ([token] if token else valid_tokens(acc)):
+        try:
+            d = api_get("/api/oauth/profile", tok)
+            return {"email": (d.get("account") or {}).get("email"),
+                    "org": (d.get("organization") or {}).get("name"),
+                    "type": (d.get("organization") or {}).get("organization_type")}
+        except Exception:
+            continue
+    return None
+
+
+def _iso(ts):
+    try:
+        return datetime.fromisoformat(ts).timestamp() if ts else None
+    except ValueError:
+        return None
+
+
+def cache_path(acc):
+    return CACHE_DIR / "usage" / f"{acc.name}.json"
+
+
+def cache_read(acc):
+    return read_json(cache_path(acc))
+
+
+def cache_write(acc, usage):
+    write_private(cache_path(acc), json.dumps(usage))
+
+
+def fetch_usage(acc):
+    """Live usage from Anthropic, or None. {'five_hour': {'pct', 'resets'}, 'seven_day': …}"""
+    if OFFLINE:
+        return None
+    for tok in valid_tokens(acc):
+        try:
+            d = api_get("/api/oauth/usage", tok, timeout=3.0)
+        except Exception:
+            continue
+        u = {"ts": now(), "src": "api"}
+        for k in ("five_hour", "seven_day"):
+            w = d.get(k) or {}
+            if w.get("utilization") is not None:
+                u[k] = {"pct": float(w["utilization"]), "resets": _iso(w.get("resets_at"))}
+        cache_write(acc, u)
+        return u
+    return None
+
+
+def usage_for(accounts, fresh=False, max_age=USAGE_TTL):
+    """Usage per seat name: fresh cache, else a parallel live fetch (≈3s cap), else stale cache."""
+    out, todo = {}, []
+    for a in accounts:
+        c = cache_read(a)
+        if c and not fresh and now() - c.get("ts", 0) < max_age:
+            out[a.name] = c
+        else:
+            out[a.name] = c
+            todo.append(a)
+
+    def work(a):
+        u = fetch_usage(a)
+        if u:
+            out[a.name] = u
+    threads = [threading.Thread(target=work, args=(a,), daemon=True) for a in todo]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(3.5)
+    return out
+
+
+def window(u, k):
+    w = (u or {}).get(k) or {}
+    if w.get("resets") and w["resets"] < now():   # window rolled over since the reading
+        return None, None
+    return w.get("pct"), w.get("resets")
+
+
+def is_limited(u):
+    return any((window(u, k)[0] or 0) >= LIMIT_PCT for k in ("five_hour", "seven_day"))
+
+
+def usage_line(u):
+    p5, r5 = window(u, "five_hour")
+    p7, _ = window(u, "seven_day")
+    age = ""
+    if u and now() - u.get("ts", 0) > 600:
+        age = color(f"  ({int((now() - u['ts']) // 60)}dk önce)", "2")
+    s = f"5s {bar(p5)}  7g {bar(p7)}"
+    if p5 is not None and p5 >= WARN_PCT and r5:
+        s += color(f"  ↻ {fmt_reset(r5)}", "2")
+    return s + age
+
+
+def limit_summary(u):
+    bits = []
+    for k, lab in (("five_hour", "5s"), ("seven_day", "7g")):
+        p, r = window(u, k)
+        if p is not None and p >= LIMIT_PCT:
+            bits.append(f"{lab} %{p:.0f}, açılış {fmt_reset(r)}")
+    return "; ".join(bits)
+
+
+# ── interactive picker (arrow keys, digits, Enter, q) ────────────────────────
+def pick(title, accounts, tool, default=None, usages=None):
+    """Returns the chosen Account or None (cancelled)."""
+    import termios
+    import tty as ttymod
+    usages = usages or {}
+    width = max(len(a.name) for a in accounts)
+    ewidth = max(len(a.email or "?") for a in accounts)
+    usable = [ready(a, tool) for a in accounts]
+    idx = next((i for i, a in enumerate(accounts) if default and a.name == default.name and usable[i]),
+               next((i for i, ok in enumerate(usable) if ok), 0))
+
+    def render(first):
+        lines = [color(title, "1")]
+        for i, a in enumerate(accounts):
+            cur = "❯" if i == idx else " "
+            name = a.name.ljust(width)
+            meta = f"{(a.email or '?').ljust(ewidth)}  {color(a.group.ljust(9), '2')}"
+            if usable[i]:
+                info = usage_line(usages.get(a.name))
+                row = f" {cur} {i + 1}) {name}  {meta} {info}"
+                lines.append(color(row, "1") if i == idx else row)
+            else:
+                lines.append(color(f" {cur} {i + 1}) {name}  {a.email or '?'}  giriş yok → seat login {a.name}", "2"))
+        lines.append(color("   ↑↓ seç · Enter onayla · q vazgeç", "2"))
+        out = "" if first else f"\033[{len(lines)}A"
+        return out + "".join(f"\r\033[2K{line}\n" for line in lines)
+
+    with open("/dev/tty", "r+b", buffering=0) as t:
+        fd = t.fileno()
+        old = termios.tcgetattr(fd)
+        t.write(b"\033[?25l")
+        t.write(render(True).encode())
+        try:
+            ttymod.setcbreak(fd)
+            while True:
+                ch = os.read(fd, 3)
+                if ch in (b"\r", b"\n"):
+                    if usable[idx]:
+                        return accounts[idx]
+                elif ch in (b"q", b"\x1b", b"\x03"):
+                    return None
+                elif ch in (b"\x1b[A", b"k"):
+                    idx = (idx - 1) % len(accounts)
+                elif ch in (b"\x1b[B", b"j"):
+                    idx = (idx + 1) % len(accounts)
+                elif ch.isdigit() and 1 <= int(ch) <= len(accounts):
+                    idx = int(ch) - 1
+                    if usable[idx]:
+                        t.write(render(False).encode())
+                        return accounts[idx]
+                t.write(render(False).encode())
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            t.write(b"\033[?25h")
+
+
+def confirm(question, default_yes=True):
+    # Separate read/write handles: a text-mode "r+" on a tty is not seekable and fails.
+    try:
+        with open("/dev/tty", "w") as out, open("/dev/tty") as inp:
+            out.write(question + (" [E/h] " if default_yes else " [e/H] "))
+            out.flush()
+            ans = inp.readline().strip().lower()
+    except OSError:
+        return False
+    return default_yes if not ans else ans in ("e", "evet", "y", "yes")
+
+
+def announce(acc, u, why=""):
+    p5, r5 = window(u, "five_hour")
+    p7, _ = window(u, "seven_day")
+    us = ""
+    if p5 is not None or p7 is not None:
+        us = " · " + " · ".join(x for x in (f"5s %{p5:.0f}" if p5 is not None else "",
+                                           f"7g %{p7:.0f}" if p7 is not None else "") if x)
+    line = color("seat ▸ ", "2") + color(acc.name, "1") + f" · {acc.email or '?'}{us}" + (color(f"  ({why})", "2") if why else "")
+    tty_write(line + "\n")
+    if p5 is not None and p5 >= WARN_PCT and p5 < LIMIT_PCT:
+        tty_write(color(f"       5 saatlik limit %{p5:.0f}, {fmt_reset(r5)} açılır\n", "33"))
+
+
+# ── shell hooks: launch / after / cd ─────────────────────────────────────────
+def cmd_launch(cfg, args):
+    """Print an env script choosing the seat for an interactive hermes/claude launch."""
+    tool = args[0] if args else "claude"
+    cwd = os.getcwd()
+    cur = cfg.current()
+    rule = cfg.rule_for(cwd)
+    if rule:
+        allowed = cfg.allowed(cwd, cur)
+        usages = usage_for(allowed)
+        good = [a for a in allowed if ready(a, tool) and not is_limited(usages.get(a.name))]
+        choice = cur if cur in good else (good[0] if good else None)
+        if choice and (choice is cur or len(good) == 1 or cur not in allowed):
+            announce(choice, usages.get(choice.name), f"proje: {rule['path'].replace(str(HOME), '~', 1)}")
+            print(choice.env_script())
+            return
+        acc = pick(f"Bu proje için Claude hesabı ({tool}):", allowed, tool, cur, usages)
+    else:
+        usages = usage_for(cfg.accounts)
+        acc = pick(f"Claude hesabı ({tool}):", cfg.accounts, tool, cur, usages)
+    if acc is None:
+        sys.exit(1)
+    announce(acc, usages.get(acc.name))
+    if is_limited(usages.get(acc.name)):
+        tty_write(color(f"       ⚠ bu hesap limitte: {limit_summary(usages.get(acc.name))}\n", "31"))
+    print(acc.env_script())
+
+
+def last_claude_session(acc, cwd, since):
+    folder = acc.claude_dir / "projects" / slug(cwd)
+    files = [p for p in folder.glob("*.jsonl") if p.stat().st_mtime >= since] if folder.is_dir() else []
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
+
+
+def transcript_hit_limit(path, since=None):
+    """Did this run end on an API limit error? Looks at the last 40 entries; errors stamped
+    before *since* belong to an earlier run (e.g. a transcript carried over from another seat)."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()[-40:]
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") == "user" and not e.get("isMeta"):
+            return False   # the user kept going after any error
+        if e.get("isApiErrorMessage") or e.get("error"):
+            ts = _iso((e.get("timestamp") or "").replace("Z", "+00:00"))
+            if since and ts and ts <= since:   # a fresh error cannot land in the launch second
+                return False
+            content = (e.get("message") or {}).get("content") or []
+            text = " ".join(c.get("text", "") for c in content if isinstance(c, dict)) + " " + json.dumps(e.get("error") or "")
+            if LIMIT_TEXT.search(text):
+                return True
+    return False
+
+
+def last_hermes_session(acc, since):
+    db = acc.hermes_home / "state.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        row = con.execute("select id from sessions where started_at >= ? and source in ('cli','tui') "
+                          "order by started_at desc limit 1", (since - 5,)).fetchone()
+        con.close()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
+def carry_claude_session(src, dst, cwd, session):
+    """Copy a Claude Code transcript (and its sidecar folder) into another seat's config
+    dir so `claude --resume <id>` finds it there."""
+    sid = session.stem
+    target = dst.claude_dir / "projects" / slug(cwd)
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(session, target / session.name)
+    side = session.with_suffix("")
+    if side.is_dir():
+        shutil.copytree(side, target / sid, dirs_exist_ok=True)
+    return sid
+
+
+def hermes_handoff(src, sid):
+    """Export the Hermes session as markdown and build a seed prompt for the new seat."""
+    out = CACHE_DIR / "handoff" / time.strftime("%Y%m%d-%H%M%S")
+    out.mkdir(parents=True, exist_ok=True)
+    for d in (CACHE_DIR, out.parent, out):   # transcripts are private
+        os.chmod(d, 0o700)
+    subprocess.run(["hermes", "sessions", "export", "--format", "md", "--session-id", sid, str(out) + "/"],
+                   env=src.proc_env(), capture_output=True, timeout=60)
+    files = sorted(out.glob("*.md"))
+    if not files:
+        return None
+    return (f"Önceki Hermes oturumu ({src.name} hesabı) Claude limiti dolduğu için yarıda kaldı. "
+            f"Transkript: {files[0]} — önce onu oku, sonra kaldığın yerden devam et; "
+            f"ne yaptığını ve sıradaki adımı kısaca özetleyerek başla.")
+
+
+def cmd_after(cfg, args):
+    """Run after hermes/claude exits. If the seat is out of limits, offer another allowed
+    seat; prints an env script + `set -- …` for the shell loop, or nothing."""
+    tool, since = args[0], float(args[1])
+    cwd = os.getcwd()
+    cur = cfg.current()
+    session = last_claude_session(cur, cwd, since) if tool == "claude" else None
+    flagged = bool(session and transcript_hit_limit(session, since))
+    cached = cache_read(cur)
+    if tool == "claude" and not flagged:
+        # The status line refreshed the cache during the session; no network needed.
+        u = cached if (cached and cached.get("ts", 0) >= since) else None
+    else:
+        u = usage_for([cur], fresh=True).get(cur.name)
+    if not (flagged or is_limited(u)):
+        return
+    reason = limit_summary(u) or "limit hatası"
+    cands = [a for a in cfg.allowed(cwd, cur) if a.name != cur.name and ready(a, tool)]
+    usages = usage_for(cands)
+    cands = sorted([a for a in cands if not is_limited(usages.get(a.name))],
+                   key=lambda a: (window(usages.get(a.name), "five_hour")[0] or 0))
+    tty_write("\n" + color(f"⚠ {cur.name} limiti doldu ({reason}).", "33") + "\n")
+    if not cands:
+        rule = cfg.rule_for(cwd)
+        scope = "bu proje" if rule else f"'{cur.group}' grubu"
+        tty_write(f"  {scope} için geçilebilecek başka hesap yok. Proje kuralı: seat bind <hesap,...>\n")
+        return
+    if len(cands) == 1:
+        target = cands[0]
+        p5 = window(usages.get(target.name), "five_hour")[0]
+        extra = f" · 5s %{p5:.0f}" if p5 is not None else ""
+        if not confirm(f"  → {target.name} ({target.email}{extra}) hesabına geçip devam edilsin mi?"):
+            return
+    else:
+        target = pick("Hangi hesapla devam edilsin?", cands, tool, cands[0], usages)
+        if target is None:
+            return
+    script = [target.env_script()]
+    if tool == "claude":
+        if session:
+            sid = carry_claude_session(cur, target, cwd, session)
+            script.append(f"set -- --resume {shlex.quote(sid)}")
+        else:
+            script.append("set --")
+    else:
+        sid = last_hermes_session(cur, since)
+        seed = hermes_handoff(cur, sid) if sid else None
+        script.append(f"set -- chat -q {shlex.quote(seed)}" if seed else "set --")
+    announce(target, usages.get(target.name), f"{cur.name} limitte")
+    print("; ".join(script))
+
+
+def cmd_cd(cfg, args):
+    """chpwd hook: inside a bound project, move this terminal onto an allowed seat."""
+    rule = cfg.rule_for(os.getcwd())
+    if not rule:
+        return
+    cur = cfg.current()
+    allowed = cfg.allowed(os.getcwd(), cur)
+    if not allowed or cur in allowed:
+        return
+    acc = allowed[0]
+    tty_write(color("seat ▸ ", "2") + color(acc.name, "1") + color(f"  (proje: {rule['path'].replace(str(HOME), '~', 1)})\n", "2"))
+    print(acc.env_script())
+
+
+# ── Claude Code status line ──────────────────────────────────────────────────
+def cmd_statusline(cfg, args):
+    """`statusLine` command for Claude Code: records rate_limits per seat and prints a
+    compact indicator. Must be fast and must never fail loudly."""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    acc = cfg.current()
+    rl = data.get("rate_limits") or {}
+    if rl:
+        u = {"ts": now(), "src": "statusline"}
+        for k in ("five_hour", "seven_day"):
+            w = rl.get(k) or {}
+            if w.get("used_percentage") is not None:
+                u[k] = {"pct": float(w["used_percentage"]), "resets": w.get("resets_at")}
+        try:
+            cache_write(acc, u)
+        except OSError:
+            pass
+    else:
+        u = cache_read(acc)
+    model = ((data.get("model") or {}).get("display_name")) or ""
+    parts = [color(acc.name, "1")]
+    if model:
+        parts.append(model)
+    for k, lab in (("five_hour", "5s"), ("seven_day", "7g")):
+        p, r = window(u, k)
+        if p is not None:
+            code = "32" if p < 70 else ("33" if p < WARN_PCT else "31")
+            s = color(f"{lab} {p:.0f}%", code)
+            if k == "five_hour" and p >= WARN_PCT and r:
+                s += color(f" ↻{datetime.fromtimestamp(r).strftime('%H:%M')}", "2")
+            parts.append(s)
+    print(" · ".join(parts))
+
+
+# ── user commands ────────────────────────────────────────────────────────────
+def link_shared_claude(dst_dir):
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(dst_dir, 0o700)
+    for item in SHARED_CLAUDE_ITEMS:
+        src, dst = DEFAULT_CLAUDE_DIR / item, dst_dir / item
+        if src.exists() and not dst.exists() and not dst.is_symlink():
+            dst.symlink_to(src)
+
+
+def isolate_hermes_profile(acc):
+    """Company seats: own memories, no copy of personal API keys."""
+    home = acc.hermes_home
+    mem = home / "memories"
+    if mem.is_symlink():
+        mem.unlink()
+    mem.mkdir(exist_ok=True)
+    env = home / ".env"
+    if env.exists() and env.stat().st_size:
+        env.rename(home / f".env.seat-backup-{time.strftime('%Y%m%d%H%M%S')}")
+        env.write_text("")
+        os.chmod(env, 0o600)
+
+
+def cmd_add(cfg, args):
+    name = email = group = None
+    isolated = None
+    it = iter(args)
+    for a in it:
+        if a == "--group":
+            group = next(it, None)
+        elif a == "--isolated":
+            isolated = True
+        elif a == "--share":
+            isolated = False
+        elif "@" in a:
+            email = a
+        elif not a.startswith("-"):
+            name = a
+        else:
+            die(f"bilinmeyen seçenek: {a}")
+    if not email:
+        die("kullanım: seat add <ad> <email> [--group G] [--isolated|--share]")
+    group = group or group_for(email)
+    name = name or group
+    if not re.fullmatch(r"[a-z][a-z0-9]{0,23}", name):
+        die(f"ad küçük harf + rakam olmalı: '{name}'")
+    ex = cfg.get(name)
+    if ex and ex.email and ex.email != email:
+        die(f"'{name}' adı zaten {ex.email} için kullanılıyor; başka bir ad ver: seat add <ad> {email}")
+    if ex and ex.is_default:
+        die(f"'{name}' varsayılan hesap")
+    if isolated is None:
+        isolated = group != cfg.default.group
+    acc = ex or Account({"name": name, "email": email, "group": group,
+                         "claude_dir": str(HOME / f".claude-{name}"), "hermes_profile": name})
+    acc.email, acc.group, acc.isolated = email, group, isolated
+    link_shared_claude(acc.claude_dir)
+    home = acc.hermes_home
+    created = False
+    if shutil.which("hermes"):
+        if not home.exists():
+            subprocess.run(["hermes", "profile", "create", name, "--clone", "--no-alias", "--description",
+                            f"Same agent on Claude seat {email} (managed by seat)."],
+                           check=True, stdout=subprocess.DEVNULL)
+            created = True
+        subprocess.run(["hermes", "-p", name, "config", "set", "auth.adopt_external_logins", "false"],
+                       check=True, stdout=subprocess.DEVNULL)
+        envf = home / ".env"
+        if envf.exists():
+            kept = [l for l in envf.read_text().splitlines()
+                    if not re.match(r"(ANTHROPIC_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=", l)]
+            envf.write_text("\n".join(kept) + ("\n" if kept else ""))
+        for item in ["skills"] + ([] if isolated else ["memories"]):
+            target, link = HERMES_ROOT / item, home / item
+            if not target.exists() or link.is_symlink():
+                continue
+            if link.exists():
+                if created:
+                    shutil.rmtree(link)
+                else:
+                    link.rename(home / f"{item}.seat-backup-{time.strftime('%Y%m%d%H%M%S')}")
+            link.symlink_to(target)
+        if isolated:
+            isolate_hermes_profile(acc)
+    if not ex:
+        cfg.accounts.append(acc)
+    cfg.save()
+    mode = "izole: kendi hafızası, kişisel API anahtarları yok" if isolated else "hafıza + .env varsayılanla ortak"
+    print(f"✓ {acc.label()} eklendi · grup {group} · {mode}")
+    print(f"  Giriş: seat login {name}")
+
+
+def cmd_init(cfg, args):
+    if not args:
+        die("kullanım: seat init <ad> <email>")
+    name, email = args[0], (args[1] if len(args) > 1 else "")
+    if not re.fullmatch(r"[a-z][a-z0-9]{0,23}", name):
+        die(f"ad küçük harf + rakam olmalı: '{name}'")
+    d = cfg.default
+    other = cfg.get(name)
+    if other and other is not d:
+        die(f"'{name}' başka bir hesabın adı")
+    for r in cfg.projects:
+        r["accounts"] = [name if n == d.name else n for n in r["accounts"]]
+    d.name = name
+    if email:
+        d.email, d.group = email, group_for(email)
+    cfg.save()
+    print(f"✓ varsayılan hesap: {d.label()} (~/.claude + Hermes default)")
+
+
+def cmd_login(cfg, args):
+    if not args:
+        die("kullanım: seat login <ad> [claude|hermes]")
+    acc = cfg.need(args[0])
+    which = args[1] if len(args) > 1 else "all"
+    want = acc.email
+    print(f"Giriş yapılacak hesap: {want or '?'}")
+    print("claude.ai tarayıcıda başka hesapla açıksa önce oradan hesap değiştir ya da linki gizli pencerede aç.\n")
+    if which in ("claude", "all"):
+        print(f"── Claude Code ({acc.name})")
+        cmd = ["claude", "auth", "login"] + (["--email", want] if want else [])
+        subprocess.run(cmd, env=acc.proc_env())
+        st = claude_auth_status(acc)
+        got = st.get("email") if st.get("loggedIn") else None
+        if want and got and got != want:
+            subprocess.run(["claude", "auth", "logout"], env=acc.proc_env(), capture_output=True)
+            print(color(f"✗ Claude Code {got} ile girdi, {want} bekleniyordu → çıkış yapıldı. Tekrar: seat login {acc.name} claude", "31"))
+        elif got:
+            print(color(f"✓ Claude Code: {got}", "32"))
+    if which in ("hermes", "all"):
+        if acc.is_default:
+            print(f"── Hermes ({acc.name}) ~/.claude girişini kullanıyor, ayrı giriş gerekmiyor.")
+        else:
+            print(f"── Hermes ({acc.name}): link açılınca {want} ile onayla, çıkan kodu buraya yapıştır")
+            subprocess.run(["hermes", "-p", acc.hermes_profile, "auth", "add", "anthropic", "--type", "oauth",
+                            "--label", f"seat-{acc.name}"])
+            who = identity(acc)
+            if want and who and who.get("email") and who["email"] != want:
+                subprocess.run(["hermes", "-p", acc.hermes_profile, "auth", "remove", "anthropic", f"seat-{acc.name}"],
+                               capture_output=True)
+                print(color(f"✗ Hermes {who['email']} ile girdi, {want} bekleniyordu → bu giriş silindi. Tekrar: seat login {acc.name} hermes", "31"))
+            elif who:
+                print(color(f"✓ Hermes: {who['email']} · {who.get('org')}", "32"))
+    print()
+    cmd_status(cfg, [acc.name])
+
+
+def cmd_status(cfg, args):
+    accs = [cfg.need(n) for n in args] if args else cfg.accounts
+    cur = cfg.current()
+    usages = usage_for(accs)
+    rule = cfg.rule_for(os.getcwd())
+    for a in accs:
+        mark = color("  ← bu terminal", "36") if a.name == cur.name else ""
+        print(f"{color('●', '36' if mark else '2')} {color(a.name, '1')}  {a.email or '?'}  {color(a.group, '2')}{mark}")
+        print(f"    limit       : {usage_line(usages.get(a.name))}")
+        st = claude_auth_status(a)
+        if st.get("loggedIn"):
+            ok = (not a.email) or st.get("email") == a.email
+            s = f"{st.get('email')} · {st.get('orgName') or '?'}"
+            print(f"    Claude Code : {s}" + ("" if ok else color(f"  ⚠ YANLIŞ HESAP (beklenen {a.email})", "31")))
+        else:
+            print(f"    Claude Code : {color('giriş yok', '33')} → seat login {a.name} claude")
+        if not hermes_ready(a):
+            print(f"    Hermes      : {color('giriş yok (açılmaz)', '33')} → seat login {a.name} hermes")
+        else:
+            who = identity(a)
+            if who:
+                ok = (not a.email) or who.get("email") == a.email
+                s = f"{who.get('email')} · {who.get('org')}"
+                print(f"    Hermes      : {s}" + ("" if ok else color(f"  ⚠ YANLIŞ HESAP (beklenen {a.email})", "31")))
+            else:
+                print("    Hermes      : giriş var (kimlik şu an sorgulanamadı)")
+    if rule:
+        print(color(f"\nBu klasörün kuralı: {rule['path'].replace(str(HOME), '~', 1)} → {', '.join(rule['accounts'])}", "2"))
+
+
+def cmd_usage(cfg, args):
+    fresh = "--refresh" in args
+    names = [a for a in args if not a.startswith("-")]
+    accs = [cfg.need(n) for n in names] if names else cfg.accounts
+    usages = usage_for(accs, fresh=fresh)
+    w = max(len(a.name) for a in accs)
+    for a in accs:
+        print(f"{a.name.ljust(w)}  {usage_line(usages.get(a.name))}")
+
+
+def cmd_bind(cfg, args):
+    if not args:
+        die("kullanım: seat bind <hesap>[,<hesap2>…] [klasör]   (ilk hesap varsayılan)")
+    names = [n for n in args[0].split(",") if n]
+    for n in names:
+        cfg.need(n)
+    path = str(Path(args[1] if len(args) > 1 else os.getcwd()).expanduser().resolve())
+    cfg.projects = [r for r in cfg.projects if r["path"] != path] + [{"path": path, "accounts": names}]
+    cfg.save()
+    print(f"✓ {path.replace(str(HOME), '~', 1)} → {', '.join(names)}"
+          + ("" if len(names) > 1 else "   (limit dolunca geçilecek yedek yok; eklemek için: seat bind "
+             + names[0] + ",<yedek>)"))
+
+
+def cmd_unbind(cfg, args):
+    path = str(Path(args[0] if args else os.getcwd()).expanduser().resolve())
+    before = len(cfg.projects)
+    cfg.projects = [r for r in cfg.projects if r["path"] != path]
+    cfg.save()
+    print("✓ kural silindi" if len(cfg.projects) < before else "bu klasörde kural yok")
+
+
+def cmd_projects(cfg, args):
+    if not cfg.projects:
+        print("Proje kuralı yok. Örn: cd ~/projects/viby-app && seat bind viby,viby2")
+        return
+    for r in sorted(cfg.projects, key=lambda r: r["path"]):
+        print(f"{r['path'].replace(str(HOME), '~', 1)}  →  {', '.join(r['accounts'])}")
+
+
+def cmd_list(cfg, args):
+    cur = cfg.current()
+    for a in cfg.accounts:
+        mark = "*" if a.name == cur.name else " "
+        print(f"{mark} {a.name:<8} {a.email or '?':<28} {a.group:<9} claude:{str(a.claude_dir).replace(str(HOME), '~', 1):<16} hermes:{a.hermes_profile}"
+              + ("  (izole)" if a.isolated else ""))
+
+
+def cmd_guard(cfg, args):
+    """Refuse to start Hermes on a seat without its own login (it would read the default
+    profile's pool and spend the default seat's limits)."""
+    acc = cfg.current()
+    if not hermes_ready(acc):
+        die(f"{acc.name} ({acc.email}) için Hermes girişi yok → seat login {acc.name} hermes")
+
+
+def cmd_env(cfg, args):
+    if not args:
+        die("kullanım: seat env <ad>")
+    acc = cfg.need(args[0])
+    if not hermes_ready(acc):
+        sys.stderr.write(f"seat: not: {acc.name} için Hermes girişi yok; bu terminalde hermes açılmaz (seat login {acc.name})\n")
+    print(acc.env_script())
+
+
+def cmd_remove(cfg, args):
+    if not args:
+        die("kullanım: seat remove <ad> [--purge]")
+    acc = cfg.need(args[0])
+    if acc.is_default:
+        die("varsayılan hesap silinemez")
+    cfg.accounts = [a for a in cfg.accounts if a.name != acc.name]
+    for r in cfg.projects:
+        r["accounts"] = [n for n in r["accounts"] if n != acc.name]
+    cfg.projects = [r for r in cfg.projects if r["accounts"]]
+    cfg.save()
+    if "--purge" in args:
+        for item in ("skills", "memories"):
+            p = acc.hermes_home / item
+            if p.is_symlink():
+                p.unlink()
+        if acc.hermes_home.exists():
+            subprocess.run(["hermes", "profile", "delete", acc.hermes_profile, "--yes"], capture_output=True)
+        if acc.claude_dir.exists():
+            subprocess.run(["claude", "auth", "logout"], env=acc.proc_env(), capture_output=True)
+            for p in acc.claude_dir.iterdir():
+                if p.is_symlink():
+                    p.unlink()
+            shutil.rmtree(acc.claude_dir, ignore_errors=True)
+        try:
+            cache_path(acc).unlink()
+        except OSError:
+            pass
+        print(f"✓ {acc.name} tamamen silindi")
+    else:
+        print(f"✓ {acc.name} listeden çıkarıldı (veri duruyor; tamamen silmek için --purge)")
+
+
+def statusline_command():
+    # The PATH entry (~/.local/bin/seat), not the resolved repo file: survives moving the repo.
+    return f"{shlex.quote(os.path.abspath(sys.argv[0]))} statusline"
+
+
+def cmd_setup(cfg, args):
+    """Install the Claude Code status line (settings.json is shared by every seat)."""
+    path = DEFAULT_CLAUDE_DIR / "settings.json"
+    data = read_json(path, {}) or {}
+    sl = data.get("statusLine")
+    if sl and "seat" not in json.dumps(sl):
+        print(f"! Claude Code'da zaten bir statusLine var, dokunmadım: {sl}")
+        print(f"  seat göstergesini istersen komutu şununla değiştir: {statusline_command()}")
+        return
+    if not sl:
+        if path.exists():
+            shutil.copy2(path, path.with_name(f"settings.json.seat-bak-{time.strftime('%Y%m%d%H%M%S')}"))
+        data["statusLine"] = {"type": "command", "command": statusline_command(), "padding": 0}
+        real = path.resolve()
+        tmp = real.with_suffix(".json.seat-tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, real)
+        print("✓ Claude Code status line kuruldu (hesap · model · 5s/7g limit). Yedek: settings.json.seat-bak-*")
+    else:
+        print("✓ Claude Code status line zaten seat")
+
+
+def cmd_doctor(cfg, args):
+    ok = lambda m: print(color("✓ ", "32") + m)
+    bad = lambda m: print(color("✗ ", "31") + m)
+    rc = HOME / ".zshrc"
+    (ok if rc.exists() and "seat shell-init" in rc.read_text() else bad)("~/.zshrc: eval \"$(seat shell-init)\"")
+    sl = (read_json(DEFAULT_CLAUDE_DIR / "settings.json", {}) or {}).get("statusLine")
+    (ok if sl and "seat" in json.dumps(sl) else bad)("Claude Code status line (seat setup)")
+    for a in cfg.accounts:
+        st = claude_auth_status(a)
+        cc_ok = bool(st.get("loggedIn"))
+        (ok if cc_ok else bad)(f"{a.name}: Claude Code girişi" + (f" ({st.get('email')})" if cc_ok else f" → seat login {a.name} claude"))
+        (ok if hermes_ready(a) else bad)(f"{a.name}: Hermes girişi" + ("" if hermes_ready(a) else f" → seat login {a.name} hermes"))
+        if not a.is_default and hermes_adopts(a) and a.hermes_home.exists():
+            bad(f"{a.name}: Hermes profili ~/.claude girişini ödünç alabilir → seat add {a.name} {a.email}")
+        if a.isolated and (a.hermes_home / "memories").is_symlink():
+            bad(f"{a.name}: izole olmalı ama hafıza ortak → seat add {a.name} {a.email} --isolated")
+    if os.environ.get("CLAUDE_CONFIG_DIR") and Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser() == DEFAULT_CLAUDE_DIR:
+        bad("CLAUDE_CONFIG_DIR=~/.claude set edilmiş; varsayılan hesap çıkış yapmış görünür, unset et")
+
+
+SHELL_INIT = r'''
+# seat — Claude seat per terminal / project. https://github.com/tolgazorlu/claude-seat-switcher
+# SEAT_ASK=0: no menu at launch · SEAT_PROMPT=0: no prompt tag
+_seat_interactive() {   # $1 tool, rest args → 0 if this is an interactive session launch
+  local tool="$1"; shift
+  [ -t 0 ] && [ -t 1 ] || return 1
+  local a; for a in "$@"; do
+    case "$a" in -h|--help|--version|-V) return 1 ;; esac
+    if [ "$tool" = hermes ]; then case "$a" in -p|--profile|--profile=*|-z|--oneshot|-Q|--quiet) return 1 ;; esac
+    else case "$a" in -p|--print|-v) return 1 ;; esac; fi
+  done
+  [ $# -eq 0 ] && return 0
+  case "$tool:$1" in
+    hermes:chat|hermes:-*) return 0 ;;
+    hermes:*) return 1 ;;
+    claude:auth|claude:mcp|claude:update|claude:upgrade|claude:doctor|claude:install|claude:setup-token|claude:plugin|claude:plugins|claude:config|claude:migrate-installer|claude:agents) return 1 ;;
+  esac
+  return 0
+}
+_seat_run() {
+  local tool="$1"; shift
+  if ! _seat_interactive "$tool" "$@"; then command "$tool" "$@"; return; fi
+  local _e _t _rc _n
+  if [ "${SEAT_ASK:-1}" != 0 ]; then
+    _e="$(command seat _launch "$tool")" || return 1
+    eval "$_e"
+  fi
+  if [ "$tool" = hermes ]; then command seat _guard || return 1; fi
+  while :; do
+    _t=$(date +%s)
+    command "$tool" "$@"; _rc=$?
+    _n="$(command seat _after "$tool" "$_t")" || break
+    [ -n "$_n" ] || break
+    eval "$_n"
+  done
+  return $_rc
+}
+hermes() { _seat_run hermes "$@"; }
+claude() { _seat_run claude "$@"; }
+seat() {
+  if [ "$1" = use ]; then
+    local _e; _e="$(command seat env "${2:?kullanım: seat use <ad>}")" || return 1
+    eval "$_e" && echo "seat ▸ bu terminal artık '$2' hesabında (claude + hermes)"
+  else command seat "$@"; fi
+}
+_seat_cd() { local _e; _e="$(command seat _cd 2>/dev/null)" && [ -n "$_e" ] && eval "$_e"; }
+if [ -n "$ZSH_VERSION" ]; then
+  autoload -Uz add-zsh-hook && add-zsh-hook chpwd _seat_cd
+  if [ "${SEAT_PROMPT:-1}" = 1 ]; then
+    setopt prompt_subst
+    case "$RPROMPT" in *SEAT_ACCOUNT*) ;; *) RPROMPT='%F{8}${SEAT_ACCOUNT:+⌁ $SEAT_ACCOUNT}%f'"$RPROMPT" ;; esac
+  fi
+fi
+_seat_cd
+'''
+
+
+def cmd_shell_init(cfg, args):
+    print(SHELL_INIT.strip())
+
+
+USAGE = f"""seat {VERSION} — Claude Code ve Hermes için terminal/proje başına Claude hesabı (seat).
+
+Kurulum:
+  seat init max ben@gmail.com          mevcut girişin adı + emaili
+  seat add work ben@sirket.com         yeni hesap (farklı şirket → otomatik izole)
+  seat login work                      tarayıcıda giriş, email doğrulanır
+  seat setup                           Claude Code status line'ına limit göstergesi
+
+Günlük:
+  hermes / claude                      açılışta hesap menüsü (↑↓ Enter); proje kuralı varsa sormaz
+  seat use <ad>                        bu terminali o hesaba geçir
+  seat bind work,work2 [klasör]        bu projede work kullan, limit dolunca work2'ye geçmeyi öner
+  seat unbind [klasör] · seat projects
+  seat status · seat usage [--refresh] · seat list · seat doctor
+  seat remove <ad> [--purge]
+
+Limit dolunca: hermes/claude kapanınca seat sorar, onaylarsan aynı oturuma diğer hesapla devam eder
+(yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler — kişisel iş şirket hesabına kaymaz).
+"""
+
+COMMANDS = {
+    "init": cmd_init, "add": cmd_add, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
+    "bind": cmd_bind, "unbind": cmd_unbind, "projects": cmd_projects, "list": cmd_list, "ls": cmd_list,
+    "env": cmd_env, "remove": cmd_remove, "rm": cmd_remove, "setup": cmd_setup, "doctor": cmd_doctor,
+    "shell-init": cmd_shell_init, "statusline": cmd_statusline,
+    "whoami": lambda cfg, args: cmd_status(cfg, [cfg.current().name]),
+    "_launch": cmd_launch, "_after": cmd_after, "_cd": cmd_cd, "_guard": cmd_guard,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    if argv[0] in ("-v", "--version", "version"):
+        print(f"seat {VERSION}")
+        return
+    if argv[0] == "use":
+        die("'seat use' shell fonksiyonu ister: ~/.zshrc'de  eval \"$(seat shell-init)\"  olmalı (yeni terminal aç)")
+    fn = COMMANDS.get(argv[0])
+    if not fn:
+        die(f"bilinmeyen komut: {argv[0]}  (seat help)")
+    fn(Config(), argv[1:])
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
