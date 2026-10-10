@@ -1,376 +1,363 @@
 #!/usr/bin/env bash
-# ccs — run Claude Code and Hermes under several Claude accounts side by side.
+# ccs — pick which Claude account (Max, company Team seats, …) Claude Code and
+# Hermes use, per terminal. Two terminals can run on two accounts at once.
 #
-# Each account gets:
-#   - its own Claude Code config dir   (~/.claude-<name>, via CLAUDE_CONFIG_DIR)
-#   - its own Hermes profile           (~/.hermes/profiles/<name>, own Anthropic login)
-#   - wrappers                         claude-<name>, hermes-<name>
-# The pre-existing setup (~/.claude + default Hermes profile) is the "default" account.
+# Per account:
+#   Claude Code  → its own config dir (~/.claude-<name>) via CLAUDE_CONFIG_DIR
+#   Hermes       → its own profile (~/.hermes/profiles/<name>) holding that
+#                  account's own Claude login; skills + memories shared
+# The pre-existing setup (~/.claude + default Hermes profile) is the default account.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CCS_HOME="${CCS_HOME:-$HOME/.config/ccs}"
-REG="$CCS_HOME/accounts.tsv"
-BIN_DIR="${CCS_BIN_DIR:-$HOME/.local/bin}"
+REG="$CCS_HOME/accounts.tsv"          # name<TAB>claude_dir<TAB>hermes_profile<TAB>email
 HERMES_ROOT="${CCS_HERMES_ROOT:-$HOME/.hermes}"
 DEFAULT_CLAUDE_DIR="$HOME/.claude"
-# Shared between all accounts (symlinked from ~/.claude): rules, settings, commands, skills…
 SHARED_CLAUDE_ITEMS=(CLAUDE.md settings.json commands agents skills hooks plugins output-styles)
-# Shared between Hermes profiles unless --isolated (symlinked from the root profile).
 SHARED_HERMES_ITEMS=(skills memories)
 PY="/usr/bin/python3"; command -v "$PY" >/dev/null 2>&1 || PY="python3"
 
-SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/$(basename "$(readlink -f "${BASH_SOURCE[0]}")")"
-
 die()  { printf 'ccs: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'ccs: uyarı: %s\n' "$*" >&2; }
+warn() { printf 'ccs: UYARI: %s\n' "$*" >&2; }
 say()  { printf '%s\n' "$*"; }
 
-# ── registry: name<TAB>claude_dir<TAB>hermes_profile ─────────────────────────
+# ── registry ─────────────────────────────────────────────────────────────────
 ensure_registry() {
   mkdir -p "$CCS_HOME"
-  [[ -f "$REG" ]] || printf 'default\t%s\tdefault\n' "$DEFAULT_CLAUDE_DIR" > "$REG"
+  [[ -f "$REG" ]] || printf 'default\t%s\tdefault\t\n' "$DEFAULT_CLAUDE_DIR" > "$REG"
+  # v0.1 rows had 3 columns; pad the email column.
+  awk -F'\t' -v OFS='\t' 'NF==3{$4=""} {print}' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
 }
 
-# lookup NAME -> sets ACC_NAME ACC_DIR ACC_PROFILE; returns 1 if missing
-lookup() {
+lookup() {   # NAME → ACC_NAME ACC_DIR ACC_PROFILE ACC_EMAIL
   local line
   line="$(awk -F'\t' -v n="$1" '$1==n {print; exit}' "$REG")"
   [[ -n "$line" ]] || return 1
-  IFS=$'\t' read -r ACC_NAME ACC_DIR ACC_PROFILE <<<"$line"
+  IFS=$'\t' read -r ACC_NAME ACC_DIR ACC_PROFILE ACC_EMAIL <<<"$line" || true
 }
-
-need_account() { lookup "$1" || die "'$1' diye bir hesap yok. Kayıtlı hesaplar: $(cut -f1 "$REG" | paste -sd, -)"; }
+need_account() { lookup "$1" || die "'$1' diye bir hesap yok. Kayıtlı: $(cut -f1 "$REG" | paste -sd, -)"; }
 is_default()   { [[ "$ACC_PROFILE" == "default" ]]; }
 profile_home() { if is_default; then printf '%s' "$HERMES_ROOT"; else printf '%s/profiles/%s' "$HERMES_ROOT" "$ACC_PROFILE"; fi; }
-valid_name()   { [[ "$1" =~ ^[a-z][a-z0-9]{0,23}$ ]] || die "hesap adı küçük harf + rakam olmalı (örn. team, work2): '$1'"; }
+valid_name()   { [[ "$1" =~ ^[a-z][a-z0-9]{0,23}$ ]] || die "ad küçük harf + rakam olmalı (örn. max, viby): '$1'"; }
+default_name() { awk -F'\t' '$3=="default"{print $1; exit}' "$REG"; }
+set_email()    { awk -F'\t' -v OFS='\t' -v n="$1" -v e="$2" '$1==n{$4=e} {print}' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"; }
 
-# ── env for an account ───────────────────────────────────────────────────────
-# Default account: CLAUDE_CONFIG_DIR must be UNSET (setting it, even to ~/.claude,
-# makes Claude Code use a different Keychain item and look logged out).
+# Default account: CLAUDE_CONFIG_DIR must stay UNSET. Claude Code picks its
+# Keychain item from that variable, so even pointing it at ~/.claude logs you out.
 apply_env() {
   export CCS_ACCOUNT="$ACC_NAME"
-  if is_default; then
-    unset CLAUDE_CONFIG_DIR HERMES_HOME
-  else
-    export CLAUDE_CONFIG_DIR="$ACC_DIR"
-    export HERMES_HOME="$(profile_home)"
-  fi
+  if is_default; then unset CLAUDE_CONFIG_DIR HERMES_HOME
+  else export CLAUDE_CONFIG_DIR="$ACC_DIR" HERMES_HOME="$(profile_home)"; fi
 }
 
-# Refuse to start Hermes on a non-default account unless it has its OWN Anthropic
-# login and does not borrow ~/.claude. A profile with zero Anthropic credentials
-# silently falls back to the root profile's pool, i.e. the default account.
-hermes_guard() {
-  is_default && return 0
-  local home; home="$(profile_home)"
-  [[ -d "$home" ]] || die "Hermes profili yok: $home  →  ccs add $ACC_NAME"
-  "$PY" - "$home" <<'PY' || exit 1
-import json, sys, re, pathlib
-home = pathlib.Path(sys.argv[1])
-cfg = (home / "config.yaml").read_text() if (home / "config.yaml").exists() else ""
-m = re.search(r"^\s*adopt_external_logins:\s*(\S+)", cfg, re.M)
-if not m or m.group(1).lower() not in ("false", "no", "off"):
-    sys.exit(f"ccs: {home.name} profilinde auth.adopt_external_logins false değil; varsayılan hesaba kayabilir. Düzelt: ccs add {home.name}")
+# ── identity (secrets never printed) ─────────────────────────────────────────
+# Prints "email<TAB>org<TAB>org_type" for a Hermes profile's own login, the
+# default profile's borrowed ~/.claude login, or nothing.
+hermes_identity() {
+  "$PY" - "$(profile_home)" "$ACC_PROFILE" "$ACC_DIR" <<'PY'
+import json, sys, time, pathlib, urllib.request
+home, profile, cdir = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+tok = ""
 try:
-    pool = json.loads((home / "auth.json").read_text()).get("credential_pool", {})
+    rows = json.loads((home / "auth.json").read_text()).get("credential_pool", {}).get("anthropic", [])
 except Exception:
-    pool = {}
-own = [r for r in pool.get("anthropic", []) if r.get("source") != "claude_code"]
-if not own:
-    sys.exit(f"ccs: {home.name} profilinin kendi Claude girişi yok; açılırsa varsayılan hesabı kullanır. Önce: ccs login {home.name} hermes")
+    rows = []
+own = [r for r in rows if r.get("source") != "claude_code"]
+if own:
+    r = own[0]
+    if r.get("access_token") and (r.get("expires_at_ms") or 0) > time.time() * 1000 + 60_000:
+        tok = r["access_token"]
+    elif r.get("access_token"):
+        print("?\tsüresi dolmuş token, ilk kullanımda yenilenir\t"); sys.exit()
+elif profile == "default":
+    try:
+        c = json.loads((cdir / ".credentials.json").read_text())["claudeAiOauth"]
+        if c.get("expiresAt", 0) > time.time() * 1000 + 60_000:
+            tok = c["accessToken"]
+    except Exception:
+        pass
+if not tok:
+    sys.exit()
+try:
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile",
+        headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+    d = json.load(urllib.request.urlopen(req, timeout=10))
+    a, o = d.get("account") or {}, d.get("organization") or {}
+    print(f"{a.get('email','?')}\t{o.get('name','?')}\t{o.get('organization_type','?')}")
+except Exception as e:
+    print(f"?\tsorgulanamadı ({type(e).__name__})\t")
 PY
 }
 
+hermes_has_own_login() {
+  "$PY" - "$(profile_home)" <<'PY'
+import json, sys, pathlib
+try:
+    rows = json.loads((pathlib.Path(sys.argv[1]) / "auth.json").read_text()).get("credential_pool", {}).get("anthropic", [])
+except Exception:
+    rows = []
+sys.exit(0 if any(r.get("source") != "claude_code" for r in rows) else 1)
+PY
+}
+
+claude_identity() {   # "email<TAB>org<TAB>plan" or nothing
+  ( apply_env; claude auth status 2>/dev/null || true ) | "$PY" -c '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit()
+if d.get("loggedIn"):
+    print("\t".join(str(d.get(k) or "?") for k in ("email", "orgName", "subscriptionType")))'
+}
+
+# Refuse to start Hermes on a non-default account without its own login: a
+# profile with zero Anthropic credentials silently reads the default profile's
+# pool, i.e. it would spend the default account's limits.
+hermes_guard() {
+  is_default && return 0
+  [[ -d "$(profile_home)" ]] || die "$ACC_NAME için Hermes profili yok → ccs add $ACC_NAME <email>"
+  grep -qE '^\s*adopt_external_logins:\s*false' "$(profile_home)/config.yaml" 2>/dev/null \
+    || die "$ACC_NAME profilinde auth.adopt_external_logins false değil → ccs add $ACC_NAME <email>"
+  hermes_has_own_login || die "$ACC_NAME ($ACC_EMAIL) için Hermes girişi yok → ccs login $ACC_NAME"
+}
+
 # ── commands ─────────────────────────────────────────────────────────────────
-cmd_add() {
-  local name="" isolated=0
+cmd_init() {    # ccs init <name> [email]: name the existing (default) setup
+  local name="${1:-}" email="${2:-}"
+  valid_name "$name"
+  if lookup "$name" && ! is_default; then die "'$name' başka bir hesabın adı"; fi
+  awk -F'\t' -v OFS='\t' -v n="$name" '$3=="default"{$1=n} {print}' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
+  [[ -n "$email" ]] && set_email "$name" "$email"
+  say "✓ varsayılan hesap (~/.claude + Hermes default profili): $name ${email:+<$email>}"
+}
+
+cmd_add() {     # ccs add <name> <email> [--isolated]
+  local name="" email="" isolated=0 a
   for a in "$@"; do
     case "$a" in
       --isolated) isolated=1 ;;
       -*) die "bilinmeyen seçenek: $a" ;;
+      *@*) email="$a" ;;
       *) name="$a" ;;
     esac
   done
-  [[ -n "$name" ]] || die "kullanım: ccs add <ad> [--isolated]"
+  [[ -n "$email" ]] || die "kullanım: ccs add <ad> <email>   örn: ccs add viby tolga@viby.dev"
+  [[ -n "$name" ]] || { name="$(printf '%s' "${email#*@}" | cut -d. -f1 | tr -cd 'a-z0-9')"; }
   valid_name "$name"
-  [[ "$name" != "default" ]] || die "'default' ayrılmış"
-  if lookup "$name" && is_default; then die "'$name' varsayılan hesabın adı"; fi
+  if lookup "$name"; then is_default && die "'$name' varsayılan hesap"; fi
 
-  local dir="$HOME/.claude-$name" phome="$HERMES_ROOT/profiles/$name" created=0
+  local dir="$HOME/.claude-$name" phome="$HERMES_ROOT/profiles/$name" created=0 item
 
-  # 1) Claude Code config dir, shared bits symlinked from ~/.claude
   mkdir -p "$dir"; chmod 700 "$dir"
   for item in "${SHARED_CLAUDE_ITEMS[@]}"; do
     if [[ -e "$DEFAULT_CLAUDE_DIR/$item" && ! -e "$dir/$item" && ! -L "$dir/$item" ]]; then
       ln -s "$DEFAULT_CLAUDE_DIR/$item" "$dir/$item"
     fi
   done
-  say "✓ Claude Code klasörü: $dir (ortak: ${SHARED_CLAUDE_ITEMS[*]})"
 
-  # 2) Hermes profile with its own Anthropic login
-  if command -v hermes >/dev/null 2>&1; then
-    if [[ ! -d "$phome" ]]; then
-      hermes profile create "$name" --clone --no-alias \
-        --description "Same agent, Claude account '$name' (managed by ccs)." >/dev/null
-      created=1
-    fi
-    # Never borrow ~/.claude (that is the default account's login).
-    hermes -p "$name" config set auth.adopt_external_logins false >/dev/null
-    # A cloned .env must not carry the default account's Anthropic token.
-    if [[ -f "$phome/.env" ]] && grep -qE '^(ANTHROPIC_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=' "$phome/.env"; then
-      sed -i '' -E '/^(ANTHROPIC_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/d' "$phome/.env"
-      say "✓ profil .env'inden Anthropic anahtarları çıkarıldı"
-    fi
-    if (( ! isolated )); then
-      for item in "${SHARED_HERMES_ITEMS[@]}"; do
-        local target="$HERMES_ROOT/$item" link="$phome/$item"
-        [[ -e "$target" ]] || continue
-        [[ -L "$link" ]] && continue
-        if [[ -e "$link" ]]; then
-          if (( created )); then rm -rf "$link"; else mv "$link" "$link.ccs-backup-$(date +%Y%m%d%H%M%S)"; fi
-        fi
-        ln -s "$target" "$link"
-      done
-      say "✓ Hermes profili: $phome (skills + memories varsayılanla ortak)"
-    else
-      say "✓ Hermes profili: $phome (izole: kendi skills/memories)"
-    fi
-  else
-    warn "hermes bulunamadı; yalnız Claude Code tarafı kuruldu"
+  if [[ ! -d "$phome" ]]; then
+    hermes profile create "$name" --clone --no-alias \
+      --description "Same agent on Claude account $email (managed by ccs)." >/dev/null
+    created=1
+  fi
+  hermes -p "$name" config set auth.adopt_external_logins false >/dev/null
+  if [[ -f "$phome/.env" ]] && grep -qE '^(ANTHROPIC_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=' "$phome/.env"; then
+    sed -i '' -E '/^(ANTHROPIC_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/d' "$phome/.env"
+  fi
+  if (( ! isolated )); then
+    for item in "${SHARED_HERMES_ITEMS[@]}"; do
+      local target="$HERMES_ROOT/$item" link="$phome/$item"
+      [[ -e "$target" && ! -L "$link" ]] || continue
+      if [[ -e "$link" ]]; then
+        if (( created )); then rm -rf "$link"; else mv "$link" "$link.ccs-backup-$(date +%Y%m%d%H%M%S)"; fi
+      fi
+      ln -s "$target" "$link"
+    done
   fi
 
-  # 3) registry + wrappers
-  if ! lookup "$name"; then printf '%s\t%s\t%s\n' "$name" "$dir" "$name" >> "$REG"; fi
-  write_wrappers "$name"
+  if lookup "$name"; then set_email "$name" "$email"
+  else printf '%s\t%s\t%s\t%s\n' "$name" "$dir" "$name" "$email" >> "$REG"; fi
 
-  say ""
-  say "Sıradaki adım (tarayıcıda $name hesabıyla giriş):  ccs login $name"
+  say "✓ '$name' <$email> eklendi (Claude Code: ${dir/#$HOME/~}, Hermes profili: $name)"
+  say "  Şimdi giriş yap:  ccs login $name"
 }
 
-write_wrappers() {
-  local name="$1"
-  mkdir -p "$BIN_DIR"
-  for tool in claude hermes; do
-    local w="$BIN_DIR/$tool-$name"
-    printf '#!/bin/sh\n# generated by ccs — %s on Claude account "%s"\nexec "%s" run %s %s "$@"\n' \
-      "$tool" "$name" "$SELF" "$name" "$tool" > "$w"
-    chmod +x "$w"
-  done
-  say "✓ komutlar: claude-$name, hermes-$name  ($BIN_DIR)"
-}
-
+# Log in and VERIFY the account matches the registered email; a wrong account
+# is logged out / removed again so it can never be used by mistake.
 cmd_login() {
   local name="${1:-}" which="${2:-all}"
   [[ -n "$name" ]] || die "kullanım: ccs login <ad> [claude|hermes|all]"
   need_account "$name"
-  if [[ "$which" == "claude" || "$which" == "all" ]]; then
-    say "── Claude Code girişi ($name). Tarayıcıda DOĞRU hesabı/organizasyonu seç."
-    ( apply_env; claude auth login ) || warn "Claude Code girişi tamamlanmadı"
+  local want="$ACC_EMAIL" got
+  [[ -n "$want" ]] || warn "$name için kayıtlı email yok; hesap doğrulaması yapılamaz (ccs add $name <email>)"
+  say "Tarayıcıda claude.ai başka bir hesapla açıksa önce oradan hesap değiştir"
+  say "ya da linki gizli pencerede aç. Giriş yapılacak hesap: ${want:-?}"
+  say ""
+
+  if [[ "$which" == claude || "$which" == all ]]; then
+    say "── 1) Claude Code girişi ($name)"
+    ( apply_env; claude auth login ${want:+--email "$want"} ) || warn "Claude Code girişi tamamlanmadı"
+    got="$(claude_identity | cut -f1)"
+    if [[ -n "$want" && -n "$got" && "$got" != "$want" ]]; then
+      ( apply_env; claude auth logout >/dev/null 2>&1 || true )
+      warn "Claude Code $got ile giriş yaptı, $want bekleniyordu → çıkış yapıldı. Tekrar dene: ccs login $name claude"
+    elif [[ -n "$got" ]]; then say "✓ Claude Code: $got"; fi
   fi
-  if [[ "$which" == "hermes" || "$which" == "all" ]]; then
+
+  if [[ "$which" == hermes || "$which" == all ]]; then
     if is_default; then
-      say "── Hermes (default) ~/.claude girişini ödünç alıyor; ayrı giriş gerekmiyor."
+      say "── 2) Hermes ($name) ~/.claude girişini kullanıyor, ayrı giriş gerekmiyor"
     else
-      say "── Hermes girişi ($name). Tarayıcıda yine $name hesabını seç, çıkan kodu buraya yapıştır."
-      hermes -p "$ACC_PROFILE" auth add anthropic --type oauth --label "ccs-$name" \
-        || warn "Hermes girişi tamamlanmadı"
+      say "── 2) Hermes girişi ($name): link açılınca $want ile onayla, çıkan kodu buraya yapıştır"
+      local after
+      hermes -p "$ACC_PROFILE" auth add anthropic --type oauth --label "ccs-$name" || warn "Hermes girişi tamamlanmadı"
+      after="$(hermes_identity | cut -f1 || true)"
+      if [[ -n "$want" && -n "$after" && "$after" != "?" && "$after" != "$want" ]]; then
+        hermes -p "$ACC_PROFILE" auth remove anthropic "ccs-$name" >/dev/null 2>&1 || true
+        warn "Hermes $after ile giriş yaptı, $want bekleniyordu → bu giriş silindi. Tekrar dene: ccs login $name hermes"
+      elif [[ -n "$after" ]]; then say "✓ Hermes: $after"; fi
     fi
   fi
   say ""
   cmd_status "$name"
 }
 
-# Prints who each side of an account is logged in as. Secrets never printed.
 cmd_status() {
-  ensure_registry
-  local names=()
+  local names=() n
   if [[ $# -gt 0 ]]; then names=("$@"); else while IFS=$'\t' read -r n _; do names+=("$n"); done < "$REG"; fi
   for n in "${names[@]}"; do
     need_account "$n"
-    local cc_json phome
-    cc_json="$( ( apply_env; claude auth status 2>/dev/null ) || true )"
-    phome="$(profile_home)"
-    "$PY" - "$ACC_NAME" "$ACC_DIR" "$phome" "$ACC_PROFILE" "$cc_json" <<'PY'
-import json, sys, time, re, pathlib, urllib.request
-name, cdir, phome, profile, cc_raw = sys.argv[1:6]
-home = pathlib.Path(phome)
-print(f"● {name}")
-
-def who(token):
-    """Ask Anthropic which account an OAuth access token belongs to."""
-    try:
-        req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers={
-            "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
-            "Content-Type": "application/json"})
-        d = json.load(urllib.request.urlopen(req, timeout=10))
-        a, o = d.get("account") or {}, d.get("organization") or {}
-        return f"{a.get('email_address') or a.get('display_name') or '?'} · {o.get('name','?')} · {o.get('organization_type','?')} ({o.get('rate_limit_tier','')})"
-    except Exception as e:
-        return f"kimlik sorgulanamadı ({type(e).__name__})"
-
-# Claude Code side
-try:
-    cc = json.loads(cc_raw) if cc_raw.strip() else {}
-except ValueError:
-    cc = {}
-if cc.get("loggedIn"):
-    bits = [cc.get("email"), cc.get("orgName"), cc.get("subscriptionType")]
-    print(f"  Claude Code : {' · '.join(str(b) for b in bits if b) or 'giriş var'}   [{cdir}]")
-else:
-    print(f"  Claude Code : giriş YOK  →  ccs login {name} claude   [{cdir}]")
-
-# Hermes side
-if not home.exists():
-    print(f"  Hermes      : profil yok  →  ccs add {name}")
-    sys.exit(0)
-cfg = (home / "config.yaml").read_text() if (home / "config.yaml").exists() else ""
-m = re.search(r"^\s*adopt_external_logins:\s*(\S+)", cfg, re.M)
-adopt = not (m and m.group(1).lower() in ("false", "no", "off"))
-try:
-    rows = json.loads((home / "auth.json").read_text()).get("credential_pool", {}).get("anthropic", [])
-except Exception:
-    rows = []
-own = [r for r in rows if r.get("source") != "claude_code"]
-label = f"profil {profile}"
-if profile == "default":
-    if any(r.get("source") == "claude_code" for r in rows) and adopt:
-        # Hermes reads the same login from <cdir>/.credentials.json (or the Keychain).
-        ident = "ödünç giriş"
-        try:
-            c = json.loads((pathlib.Path(cdir) / ".credentials.json").read_text())["claudeAiOauth"]
-            if c.get("expiresAt", 0) > time.time() * 1000 + 60_000:
-                ident = who(c["accessToken"])
-            else:
-                ident = "ödünç giriş; token süresi dolmuş, ilk kullanımda yenilenir"
-        except Exception:
-            pass
-        print(f"  Hermes      : {ident} — ~/.claude girişini ödünç alıyor   [{label}]")
-    elif own:
-        print(f"  Hermes      : kendi girişi ({own[0].get('label')})   [{label}]")
-    else:
-        print(f"  Hermes      : Anthropic girişi yok   [{label}]")
-    sys.exit(0)
-if not own:
-    print(f"  Hermes      : kendi girişi YOK → açılmaz (yoksa varsayılan hesaba düşerdi)  →  ccs login {name} hermes   [{label}]")
-    sys.exit(0)
-r = own[0]
-tok, exp = r.get("access_token") or "", r.get("expires_at_ms") or 0
-if tok and (not exp or exp > time.time() * 1000 + 60_000):
-    ident = who(tok)
-else:
-    ident = "token süresi dolmuş; ilk kullanımda yenilenir"
-flag = "" if not adopt else "  ⚠ adopt_external_logins açık"
-print(f"  Hermes      : {ident}   [{label}]{flag}")
-PY
+    local cc hm mark=""
+    [[ "${CCS_ACCOUNT:-}" == "$ACC_NAME" ]] && mark="  ← bu terminal"
+    say "● $ACC_NAME  <${ACC_EMAIL:-email kayıtlı değil}>$mark"
+    cc="$(claude_identity)"
+    if [[ -n "$cc" ]]; then say "    Claude Code : ${cc//$'\t'/ · }$(mismatch "${cc%%$'\t'*}")"
+    else say "    Claude Code : giriş yok  → ccs login $ACC_NAME claude"; fi
+    if ! is_default && ! hermes_has_own_login; then
+      say "    Hermes      : giriş yok (açılmaz)  → ccs login $ACC_NAME hermes"
+    else
+      hm="$(hermes_identity)"
+      if [[ -n "$hm" ]]; then say "    Hermes      : ${hm//$'\t'/ · }$(mismatch "${hm%%$'\t'*}")"
+      else say "    Hermes      : giriş bulunamadı"; fi
+    fi
   done
+}
+mismatch() { [[ -n "$ACC_EMAIL" && "$1" != "?" && "$1" != "$ACC_EMAIL" ]] && printf '   ⚠ YANLIŞ HESAP (beklenen %s)' "$ACC_EMAIL" || true; }
+
+# Interactive account menu on the terminal; prints the chosen name on stdout.
+cmd_pick() {
+  local cur="${CCS_ACCOUNT:-$(default_name)}" i=0 names=() n d p e choice
+  exec 3</dev/tty 4>/dev/tty || die "terminal yok"
+  printf 'Claude hesabı:\n' >&4
+  while IFS=$'\t' read -r n d p e; do
+    i=$((i+1)); names+=("$n")
+    printf '  %d) %-8s %s%s\n' "$i" "$n" "${e:-?}" "$([[ "$n" == "$cur" ]] && printf '   (Enter)')" >&4
+  done < "$REG"
+  printf 'Seçim: ' >&4
+  IFS= read -r choice <&3 || exit 1
+  [[ -z "$choice" ]] && { printf '%s\n' "$cur"; return; }
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+    printf '%s\n' "${names[$((choice-1))]}"; return
+  fi
+  for n in "${names[@]}"; do [[ "$n" == "$choice" ]] && { printf '%s\n' "$n"; return; }; done
+  die "geçersiz seçim: $choice"
+}
+
+cmd_env() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "kullanım: ccs env <ad>"
+  need_account "$name"
+  hermes_guard
+  if is_default; then printf 'unset CLAUDE_CONFIG_DIR HERMES_HOME; export CCS_ACCOUNT=%q\n' "$ACC_NAME"
+  else printf 'export CLAUDE_CONFIG_DIR=%q HERMES_HOME=%q CCS_ACCOUNT=%q\n' "$ACC_DIR" "$(profile_home)" "$ACC_NAME"; fi
 }
 
 cmd_run() {
   local name="${1:-}"; shift || true
-  [[ -n "$name" && $# -gt 0 ]] || die "kullanım: ccs run <ad> <komut> [arg…]"
-  ensure_registry; need_account "$name"
+  [[ -n "$name" && $# -gt 0 ]] || die "kullanım: ccs run <ad> <komut…>"
+  need_account "$name"
   apply_env
-  if [[ "$(basename "$1")" == "hermes" ]]; then
-    hermes_guard
-  fi
+  [[ "$(basename "$1")" == hermes ]] && hermes_guard
   exec "$@"
-}
-
-# Printed for `eval` by the shell function from `ccs shell-init`.
-cmd_env() {
-  local name="${1:-}"
-  [[ -n "$name" ]] || die "kullanım: ccs env <ad>"
-  ensure_registry; need_account "$name"
-  if is_default; then
-    printf 'unset CLAUDE_CONFIG_DIR HERMES_HOME; export CCS_ACCOUNT=%q\n' "$ACC_NAME"
-  else
-    hermes_guard
-    printf 'export CLAUDE_CONFIG_DIR=%q HERMES_HOME=%q CCS_ACCOUNT=%q\n' "$ACC_DIR" "$(profile_home)" "$ACC_NAME"
-  fi
 }
 
 cmd_shell_init() {
   cat <<'SH'
-# ccs: `ccs use <ad>` bu terminaldeki claude + hermes hesabını değiştirir.
+# ccs — `hermes` ve `claude` açılırken Claude hesabı sorar; seçim bu terminale yapışır.
+# Sormasın istersen: export CCS_ASK=0  (o zaman `ccs use <ad>` ile seçersin)
+_ccs_choose() {
+  local _a _e
+  _a="$(command ccs pick)" || return 1
+  _e="$(command ccs env "$_a")" || return 1
+  eval "$_e"
+}
+_ccs_should_ask() {   # $1 = tool, rest = args
+  local tool="$1"; shift
+  [ "${CCS_ASK:-1}" = 0 ] && return 1
+  [ -t 0 ] && [ -t 1 ] || return 1
+  local a; for a in "$@"; do
+    case "$a" in -p|--profile|--profile=*) [ "$tool" = hermes ] && return 1 ;; esac
+    case "$a" in -p|--print|-v|--version|-h|--help) [ "$tool" = claude ] && return 1 ;; esac
+    case "$a" in --version|-V|-h|--help) return 1 ;; esac
+  done
+  [ $# -eq 0 ] && return 0
+  case "$tool:$1" in
+    hermes:chat|hermes:-*) return 0 ;;
+    hermes:*) return 1 ;;
+    claude:auth|claude:mcp|claude:update|claude:upgrade|claude:doctor|claude:install|claude:setup-token|claude:plugin|claude:plugins|claude:config|claude:migrate-installer) return 1 ;;
+    claude:*) return 0 ;;
+  esac
+}
+hermes() { if _ccs_should_ask hermes "$@"; then _ccs_choose || return 1; fi; command hermes "$@"; }
+claude() { if _ccs_should_ask claude "$@"; then _ccs_choose || return 1; fi; command claude "$@"; }
 ccs() {
-  if [ "$1" = "use" ]; then
-    [ -n "$2" ] || { echo "kullanım: ccs use <ad>" >&2; return 1; }
-    local _ccs_env; _ccs_env="$(command ccs env "$2")" || return 1
-    eval "$_ccs_env" && echo "ccs: bu terminal artık '$2' hesabında (claude + hermes)"
-  else
-    command ccs "$@"
-  fi
+  if [ "$1" = use ]; then
+    local _e; _e="$(command ccs env "${2:?kullanım: ccs use <ad>}")" || return 1
+    eval "$_e" && echo "ccs: bu terminal artık '$2' hesabında (claude + hermes)"
+  else command ccs "$@"; fi
 }
 SH
 }
 
 cmd_list() {
-  ensure_registry
-  local cur="${CCS_ACCOUNT:-}"
-  while IFS=$'\t' read -r n d p; do
-    local mark=" "; [[ "$n" == "$cur" ]] && mark="*"
-    printf '%s %-10s claude: %-28s hermes profili: %s\n' "$mark" "$n" "${d/#$HOME/~}" "$p"
+  local n d p e
+  while IFS=$'\t' read -r n d p e; do
+    printf '%s %-8s %-28s claude: %-18s hermes: %s\n' "$([[ "$n" == "${CCS_ACCOUNT:-}" ]] && echo '*' || echo ' ')" \
+      "$n" "${e:-?}" "${d/#$HOME/~}" "$p"
   done < "$REG"
 }
 
-cmd_whoami() {
-  ensure_registry
-  local n="${CCS_ACCOUNT:-}"
-  if [[ -z "$n" ]]; then
-    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then n="$(awk -F'\t' -v d="$CLAUDE_CONFIG_DIR" '$2==d{print $1}' "$REG")"; fi
-    n="${n:-$(awk -F'\t' '$3=="default"{print $1; exit}' "$REG")}"
-  fi
-  cmd_status "$n"
-}
-
-cmd_init() {
-  local name="${1:-}"
-  valid_name "$name"
-  ensure_registry
-  lookup "$name" && ! is_default && die "'$name' zaten başka bir hesap"
-  awk -F'\t' -v OFS='\t' -v n="$name" '$3=="default"{$1=n} {print}' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
-  say "✓ varsayılan hesabın (~/.claude + default Hermes) adı: $name"
-}
-
 cmd_remove() {
-  local name="${1:-}" purge="${2:-}"
-  [[ -n "$name" ]] || die "kullanım: ccs remove <ad> [--purge]"
-  ensure_registry; need_account "$name"
+  local name="${1:-}" purge="${2:-}" item
+  need_account "$name"
   is_default && die "varsayılan hesap silinemez"
-  rm -f "$BIN_DIR/claude-$name" "$BIN_DIR/hermes-$name"
   awk -F'\t' -v n="$name" '$1!=n' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
-  say "✓ $name kayıttan ve komutlardan çıkarıldı"
-  if [[ "$purge" == "--purge" ]]; then
-    # Unlink shared items first so deleting the profile can never touch the originals.
+  rm -f "$HOME/.local/bin/claude-$name" "$HOME/.local/bin/hermes-$name"   # v0.1 wrappers
+  if [[ "$purge" == --purge ]]; then
     local phome; phome="$(profile_home)"
     for item in "${SHARED_HERMES_ITEMS[@]}"; do [[ -L "$phome/$item" ]] && rm "$phome/$item"; done
-    hermes profile delete "$ACC_PROFILE" || warn "Hermes profili silinemedi"
-    find "$ACC_DIR" -maxdepth 1 -type l -delete 2>/dev/null || true
-    rm -rf "$ACC_DIR"
-    say "✓ $ACC_DIR ve Hermes profili silindi (Keychain kaydı: Claude Code'da /logout ile temizlenir)"
+    [[ -d "$phome" ]] && { hermes profile delete "$ACC_PROFILE" --yes >/dev/null 2>&1 || hermes profile delete "$ACC_PROFILE" </dev/null >/dev/null 2>&1 || warn "Hermes profili silinemedi: $ACC_PROFILE"; }
+    if [[ -d "$ACC_DIR" ]]; then ( apply_env; claude auth logout >/dev/null 2>&1 || true ); find "$ACC_DIR" -maxdepth 1 -type l -delete; rm -rf "$ACC_DIR"; fi
+    say "✓ $name tamamen silindi"
   else
-    say "  veriler duruyor: $ACC_DIR, $(profile_home)  (silmek için: ccs remove $name --purge)"
+    say "✓ $name listeden çıkarıldı (veri duruyor; tamamen silmek için --purge)"
   fi
 }
 
 usage() {
   cat <<EOF
-ccs $VERSION — Claude Code ve Hermes'i birden çok Claude hesabıyla yan yana çalıştır.
+ccs $VERSION — Claude Code ve Hermes için terminal başına Claude hesabı seçimi.
 
-  ccs init <ad>              mevcut kurulumun (~/.claude + default Hermes) adı, örn. max
-  ccs add <ad> [--isolated]  yeni hesap: ~/.claude-<ad>, Hermes profili <ad>, claude-<ad>/hermes-<ad>
-  ccs login <ad> [claude|hermes|all]   tarayıcıda giriş (Claude Code ve Hermes ayrı ayrı)
-  ccs status [ad…]           her hesap gerçekte hangi Claude hesabına bağlı (Anthropic'e sorar)
-  ccs whoami                 bu terminal hangi hesapta
-  ccs list                   kayıtlı hesaplar (* = bu terminal)
-  ccs run <ad> <komut…>      tek komutu o hesapla çalıştır (ccs run team claude -c)
-  ccs use <ad>               bu terminali o hesaba geçir (shell-init gerekir)
-  ccs env <ad>               use'un bastığı export satırları
-  ccs shell-init             .zshrc için:  eval "\$(ccs shell-init)"
-  ccs remove <ad> [--purge]  hesabı kaldır
+Kurulum (bir kez):
+  ccs init max tolgazorlu17@gmail.com    mevcut kurulumun adı + emaili
+  ccs add viby tolga@viby.dev            yeni hesap
+  ccs login viby                         tarayıcıda giriş (Claude Code + Hermes), email doğrulanır
 
-Örnek:  claude-team  |  hermes-team  |  ccs use team && hermes
+Günlük:
+  hermes / claude      açılırken hangi hesap diye sorar; seçim o terminale yapışır
+  ccs use <ad>         bu terminali sormadan o hesaba geçir
+  ccs status           her hesabın gerçekte kime bağlı olduğu (Anthropic'e sorar)
+  ccs list | whoami | remove <ad> [--purge] | run <ad> <komut…>
 EOF
 }
 
@@ -382,11 +369,12 @@ main() {
     add) cmd_add "$@" ;;
     login) cmd_login "$@" ;;
     status) cmd_status "$@" ;;
-    whoami) cmd_whoami ;;
+    whoami) cmd_status "${CCS_ACCOUNT:-$(default_name)}" ;;
     list|ls) cmd_list ;;
-    run) cmd_run "$@" ;;
+    pick) cmd_pick ;;
     env) cmd_env "$@" ;;
-    use) die "'use' shell fonksiyonu ister: .zshrc'ye  eval \"\$(ccs shell-init)\"  ekle ya da: eval \"\$(ccs env ${1:-<ad>})\"" ;;
+    run) cmd_run "$@" ;;
+    use) die "'ccs use' için .zshrc'de  eval \"\$(ccs shell-init)\"  olmalı (yeni terminal aç)" ;;
     shell-init) cmd_shell_init ;;
     remove|rm) cmd_remove "$@" ;;
     -v|--version|version) say "ccs $VERSION" ;;
