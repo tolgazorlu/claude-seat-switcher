@@ -200,6 +200,11 @@ class SeatTest(unittest.TestCase):
             {"source": "manual:hermes_pkce", "label": "seat-viby"}]}}))
         run(self.seat, self.seat.cmd_guard)   # own login → allowed
 
+    def test_email_change_keeps_seat_and_group(self):
+        run(self.seat, self.seat.cmd_email, "viby", "contact@viby.com")
+        acc = self.seat.Config().get("viby")
+        self.assertEqual((acc.email, acc.group), ("contact@viby.com", "viby"))
+
     def test_cd_hook_switches_into_bound_project(self):
         run(self.seat, self.seat.cmd_bind, "viby")
         os.environ["SEAT_ACCOUNT"] = "max"

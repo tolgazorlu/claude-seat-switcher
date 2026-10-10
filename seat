@@ -800,6 +800,18 @@ def cmd_add(cfg, args):
     print(f"  Giriş: seat login {name}")
 
 
+def cmd_email(cfg, args):
+    """Change the email a seat is verified against (logins made for the old email stay
+    until you log in again)."""
+    if len(args) != 2 or "@" not in args[1]:
+        die("kullanım: seat email <ad> <yeni-email>")
+    acc = cfg.need(args[0])
+    old, acc.email = acc.email, args[1]
+    cfg.save()
+    print(f"✓ {acc.name}: {old or '?'} → {acc.email} (grup: {acc.group})")
+    print(f"  Bu hesapla yeniden giriş yap: seat login {acc.name}")
+
+
 def cmd_init(cfg, args):
     if not args:
         die("kullanım: seat init <ad> <email>")
@@ -1175,7 +1187,7 @@ Limit dolunca: hermes/claude kapanınca seat sorar, onaylarsan aynı oturuma di�
 """
 
 COMMANDS = {
-    "init": cmd_init, "add": cmd_add, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
+    "init": cmd_init, "add": cmd_add, "email": cmd_email, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
     "bind": cmd_bind, "unbind": cmd_unbind, "projects": cmd_projects, "list": cmd_list, "ls": cmd_list,
     "env": cmd_env, "remove": cmd_remove, "rm": cmd_remove, "setup": cmd_setup, "doctor": cmd_doctor,
     "shell-init": cmd_shell_init, "statusline": cmd_statusline,
