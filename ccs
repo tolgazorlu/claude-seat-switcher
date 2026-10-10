@@ -144,7 +144,11 @@ cmd_add() {     # ccs add <name> <email> [--isolated]
   [[ -n "$email" ]] || die "kullanım: ccs add <ad> <email>   örn: ccs add viby tolga@viby.dev"
   [[ -n "$name" ]] || { name="$(printf '%s' "${email#*@}" | cut -d. -f1 | tr -cd 'a-z0-9')"; }
   valid_name "$name"
-  if lookup "$name"; then is_default && die "'$name' varsayılan hesap"; fi
+  if lookup "$name"; then
+    is_default && die "'$name' varsayılan hesap"
+    [[ -z "$ACC_EMAIL" || "$ACC_EMAIL" == "$email" ]] \
+      || die "'$name' adı zaten $ACC_EMAIL için kullanılıyor; başka bir ad ver: ccs add <ad> $email"
+  fi
 
   local dir="$HOME/.claude-$name" phome="$HERMES_ROOT/profiles/$name" created=0 item
 
