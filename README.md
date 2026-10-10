@@ -1,91 +1,134 @@
-# ccs
+# claude-seat-switcher
 
-Choose which Claude account each terminal uses with
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) and
-[Hermes Agent](https://hermes-agent.nousresearch.com). For example, run a personal
-Max plan in one terminal and a company Team seat in another. Each terminal uses
-that account's own limits.
+`seat` sets which Claude account ("seat") [Claude Code](https://code.claude.com) and
+[Hermes Agent](https://hermes-agent.nousresearch.com) use, separately for each
+terminal and each project. For example:
+
+- a personal Max plan in one terminal
+- a company Team seat in another
+- a second Team seat in a third
 
 ```
 $ hermes
-Claude hesabı:
-  1) max      me@gmail.com        (Enter)
-  2) work     me@company.com
-  3) work2    me2@company.com
-Seçim: 2
+Claude hesabı (hermes):
+ ❯ 1) max    me@gmail.com      personal  5s ██░░░░░░  24%  7g ███░░░░░  36%
+   2) work   me@company.com    company   5s █░░░░░░░  10%  7g ░░░░░░░░   3%
+   3) work2  me2@company.com   company   giriş yok → seat login work2
+   ↑↓ seç · Enter onayla · q vazgeç
+seat ▸ max · me@gmail.com · 5s %24 · 7g %36
 ```
+
+## What it does
+
+- **Menu on launch.** `hermes` and `claude` open a menu with arrow-key selection and
+  live 5-hour and 7-day limit bars. Whatever you pick stays in effect for that terminal.
+- **Project rules.** Run `seat bind work,work2` inside a project. From then on, that
+  folder uses `work` without asking, and `cd` into it switches the terminal over.
+  The prompt shows the active seat, e.g. `⌁ work`.
+- **Limit indicator.** The Claude Code status line shows `work · Opus · 5s 23% · 7g 41%`.
+  `seat usage` lists every seat.
+- **Limit handoff.** When Claude Code or Hermes stops because the seat hit its limit,
+  `seat` asks: `work limiti doldu → work2 hesabına geçip devam edilsin mi? [E/h]`.
+  - Claude Code continues the same session with `--resume`.
+  - Hermes starts a new session seeded with the previous transcript.
+  - Only seats allowed for the project are offered. Without a rule, only seats in the
+    same group are offered, so personal work never moves onto a company seat.
+  - It never switches without asking.
+- **Hermes safety.** Each non-default seat has its own Hermes profile and its own
+  login, and `auth.adopt_external_logins` is off. Hermes won't start on a seat that
+  has no login. Otherwise it would silently spend the default seat's limits.
+- **Company seats are isolated by default.** They get their own Hermes memories and
+  none of your personal API keys.
 
 ## Requirements
 
-- macOS (it uses the Keychain-backed Claude Code login and BSD `sed`)
-- bash and python3 (both ship with macOS)
-- Claude Code (`claude`) and/or Hermes Agent (`hermes`), already installed
-- `gh` (GitHub CLI), logged in, to clone this private repo
+- macOS, `python3` (included with macOS), zsh
+- Claude Code and/or Hermes Agent
+- `gh`, logged in (this repo is private)
 
 ## Install
 
 ```sh
-gh repo clone tolgazorlu/ccs ~/projects/ccs
-~/projects/ccs/install.sh
+gh repo clone tolgazorlu/claude-seat-switcher ~/projects/claude-seat-switcher
+~/projects/claude-seat-switcher/install.sh
 ```
 
-The installer does two things:
-- links `ccs` into `~/.local/bin`
-- adds `eval "$(ccs shell-init)"` to `~/.zshrc`, which defines the `hermes`, `claude` and `ccs` shell functions
+The installer:
+- links `seat` into `~/.local/bin`
+- adds `eval "$(seat shell-init)"` to `~/.zshrc`
+- installs the Claude Code status line (backing up `settings.json` first)
 
-Open a new terminal once it finishes.
-
-Update: `git -C ~/projects/ccs pull`. You don't need to run anything else, because the link points into the repo.
+Open a new terminal afterwards. To update: `git -C ~/projects/claude-seat-switcher pull`.
 
 ## Setup
 
 ```sh
-ccs init max me@gmail.com        # the account you're already logged in with (~/.claude, default Hermes)
-ccs add work me@company.com      # every other Claude account
-ccs add work2 me2@company.com
-ccs login work                   # browser login for Claude Code, then Hermes; email is checked
-ccs status                       # asks Anthropic which account each side really uses
+seat init max me@gmail.com         # the login you already have (~/.claude + default Hermes)
+seat add work me@company.com       # each additional seat; group = email domain
+seat add work2 me2@company.com
+seat login work                    # browser login for Claude Code, then Hermes; email is checked
+seat doctor                        # what is missing
 ```
 
-Log in with the right account in the browser. If claude.ai is already open with a
-different account, use a private window. When the email doesn't match, `ccs login`
-removes that login again.
+Make sure the browser is logged in to the right account. If claude.ai is already
+open with a different one, use a private window. If the email doesn't match,
+`seat login` signs out of that login again.
 
-Accounts are stored in `~/.config/ccs/accounts.tsv`. After a fresh OS install, run
-the steps above again. Logins can't be carried over.
+Config lives in `~/.config/seat/config.json`. After a fresh OS install, repeat the
+steps above; logins can't be carried over.
 
-## Daily use
+## Commands
 
 | Command | What it does |
 |---|---|
-| `hermes`, `claude` | ask which account, then remember the choice for this terminal (Enter keeps it) |
-| `ccs use <name>` | switch this terminal without the menu |
-| `ccs status` / `ccs whoami` | all accounts / this terminal |
-| `ccs list` | registered accounts |
-| `ccs remove <name> [--purge]` | unregister (`--purge` also deletes its login and data) |
-| `export CCS_ASK=0` | turn the menu off |
+| `hermes`, `claude` | menu, or the project rule if one exists; offers a handoff when the limit is hit |
+| `seat use <name>` | switch this terminal without the menu |
+| `seat bind a,b [dir]` / `seat unbind` / `seat projects` | project rules; the first seat is the default, the rest are fallbacks |
+| `seat status` / `seat whoami` | login and real account for every seat / for this terminal |
+| `seat usage [--refresh]` | limit bars |
+| `seat list` · `seat doctor` · `seat remove <name> [--purge]` | |
+| `SEAT_ASK=0` · `SEAT_PROMPT=0` | turn off the launch menu / the prompt tag |
 
-Subcommands such as `hermes config` or `claude mcp` don't show the menu. They run on the terminal's current account.
+Subcommands such as `hermes config` or `claude mcp` don't show the menu. They run on
+the terminal's current seat.
 
 ## How it works
 
-| | default account | other accounts |
+| | default seat | other seats |
 |---|---|---|
-| Claude Code | `~/.claude`, `CLAUDE_CONFIG_DIR` unset | `CLAUDE_CONFIG_DIR=~/.claude-<name>` |
-| Hermes | default profile, borrows the `~/.claude` login | profile `~/.hermes/profiles/<name>` with its own Claude login and `auth.adopt_external_logins: false` |
+| Claude Code | `~/.claude`, `CLAUDE_CONFIG_DIR` **unset** | `CLAUDE_CONFIG_DIR=~/.claude-<name>` (CLAUDE.md, settings, commands, agents, skills, hooks and plugins are symlinked from `~/.claude`) |
+| Hermes | default profile, borrows the `~/.claude` login | `HERMES_HOME=~/.hermes/profiles/<name>`: own OAuth login; skills shared; memories shared only within the same group |
 
-Shared through symlinks:
-- Claude Code: `CLAUDE.md`, settings, commands, agents, skills, hooks, plugins
-- Hermes: skills and memories (use `ccs add <name> <email> --isolated` to keep them separate)
+Limit data:
+- **Claude Code:** the status line writes what Claude Code reports (`rate_limits`) to
+  `~/.cache/seat/usage/`.
+- **Hermes and the menu:** `api.anthropic.com/api/oauth/usage` is queried with the
+  seat's still-valid token.
 
-Separate per account: logins and session history. Hermes `.env` is copied once, when you run `ccs add`.
+Tokens are never printed and never refreshed. Refresh tokens are single-use, so
+refreshing one would sign Claude Code out.
 
-Safety: a Hermes profile with no Claude login of its own falls back to the default
-profile's login, which spends the default account's limits. ccs won't start Hermes
-on an account until that account has its own login.
+## Rules and risks
 
-## Notes
+- Anthropic says OAuth (subscription) login is meant for Claude Code and Anthropic's
+  own apps ([legal-and-compliance](https://code.claude.com/docs/en/legal-and-compliance)).
+  Hermes uses that login, so it falls outside that intent. On company seats, use
+  Hermes with an API key or check with the company first.
+- Rotating between seats to systematically get around limits goes against the usage
+  policy. That's why `seat` always asks and only offers seats that are allowed for
+  the project.
+- Before making this repo public, the name needs to change: the Claude name can't be
+  used in a product name.
 
-- Don't set `CLAUDE_CONFIG_DIR=~/.claude` yourself. Claude Code picks its Keychain
-  item based on that variable, so the default account would look logged out.
-- A running Hermes session can't switch accounts. Open another terminal instead.
+## Credits
+
+The following inspired the ideas; no code was copied:
+- [uwuclxdy/clauth](https://github.com/uwuclxdy/clauth) (MIT): usage bars, fallback chain
+- [Nemo-Illusionist/claude-code-account-switcher](https://github.com/Nemo-Illusionist/claude-code-account-switcher) (MIT): directory binding
+- [inulute/cux](https://github.com/inulute/cux) (GPL-3.0): per-project seat pools, resuming after a switch
+
+## Development
+
+```sh
+python3 -m unittest discover -s tests     # offline, throwaway HOME, never touches real logins
+```
