@@ -992,6 +992,9 @@ def statusline_command():
 def cmd_setup(cfg, args):
     """Install the Claude Code status line (settings.json is shared by every seat)."""
     path = DEFAULT_CLAUDE_DIR / "settings.json"
+    if not DEFAULT_CLAUDE_DIR.is_dir():
+        print("! ~/.claude yok (Claude Code henüz kurulmamış/açılmamış); status line'ı sonra kur: seat setup")
+        return
     data = read_json(path, {}) or {}
     sl = data.get("statusLine")
     if sl and "seat" not in json.dumps(sl):
