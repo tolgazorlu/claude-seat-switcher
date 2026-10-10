@@ -39,7 +39,7 @@ lookup() {   # NAME → ACC_NAME ACC_DIR ACC_PROFILE ACC_EMAIL
 need_account() { lookup "$1" || die "'$1' diye bir hesap yok. Kayıtlı: $(cut -f1 "$REG" | paste -sd, -)"; }
 is_default()   { [[ "$ACC_PROFILE" == "default" ]]; }
 profile_home() { if is_default; then printf '%s' "$HERMES_ROOT"; else printf '%s/profiles/%s' "$HERMES_ROOT" "$ACC_PROFILE"; fi; }
-valid_name()   { [[ "$1" =~ ^[a-z][a-z0-9]{0,23}$ ]] || die "ad küçük harf + rakam olmalı (örn. max, viby): '$1'"; }
+valid_name()   { [[ "$1" =~ ^[a-z][a-z0-9]{0,23}$ ]] || die "ad küçük harf + rakam olmalı (örn. max, work): '$1'"; }
 default_name() { awk -F'\t' '$3=="default"{print $1; exit}' "$REG"; }
 set_email()    { awk -F'\t' -v OFS='\t' -v n="$1" -v e="$2" '$1==n{$4=e} {print}' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"; }
 
@@ -141,7 +141,7 @@ cmd_add() {     # ccs add <name> <email> [--isolated]
       *) name="$a" ;;
     esac
   done
-  [[ -n "$email" ]] || die "kullanım: ccs add <ad> <email>   örn: ccs add viby tolga@viby.dev"
+  [[ -n "$email" ]] || die "kullanım: ccs add <ad> <email>   örn: ccs add work ben@sirket.com"
   [[ -n "$name" ]] || { name="$(printf '%s' "${email#*@}" | cut -d. -f1 | tr -cd 'a-z0-9')"; }
   valid_name "$name"
   if lookup "$name"; then
@@ -353,9 +353,9 @@ usage() {
 ccs $VERSION — Claude Code ve Hermes için terminal başına Claude hesabı seçimi.
 
 Kurulum (bir kez):
-  ccs init max tolgazorlu17@gmail.com    mevcut kurulumun adı + emaili
-  ccs add viby tolga@viby.dev            yeni hesap
-  ccs login viby                         tarayıcıda giriş (Claude Code + Hermes), email doğrulanır
+  ccs init max ben@gmail.com            mevcut kurulumun adı + emaili
+  ccs add work ben@sirket.com           yeni hesap
+  ccs login work                        tarayıcıda giriş (Claude Code + Hermes), email doğrulanır
 
 Günlük:
   hermes / claude      açılırken hangi hesap diye sorar; seçim o terminale yapışır
