@@ -1,40 +1,49 @@
 #!/usr/bin/env bash
-# Install ccs: link it onto PATH and load its shell functions in zsh/bash.
-# Safe to run again; it only adds what is missing.
+# Install seat: link it onto PATH, load its shell functions in zsh, and add the
+# Claude Code status line. Safe to run again; it only adds what is missing.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${CCS_BIN_DIR:-$HOME/.local/bin}"
-INIT_LINE='command -v ccs >/dev/null && eval "$(ccs shell-init)"'
+BIN_DIR="${SEAT_BIN_DIR:-$HOME/.local/bin}"
+RC="$HOME/.zshrc"
+INIT_LINE='command -v seat >/dev/null && eval "$(seat shell-init)"'
+
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 1; }
 
 mkdir -p "$BIN_DIR"
-chmod +x "$REPO_DIR/ccs"
-ln -sf "$REPO_DIR/ccs" "$BIN_DIR/ccs"
-echo "✓ $BIN_DIR/ccs -> $REPO_DIR/ccs"
+chmod +x "$REPO_DIR/seat"
+ln -sf "$REPO_DIR/seat" "$BIN_DIR/seat"
+echo "✓ $BIN_DIR/seat -> $REPO_DIR/seat"
 
-for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-  [[ -f "$rc" || "$rc" == "$HOME/.zshrc" ]] || continue
-  touch "$rc"
-  if ! grep -qF 'ccs shell-init' "$rc"; then
-    printf '\n# ccs: ask which Claude account hermes/claude should use\n%s\n' "$INIT_LINE" >> "$rc"
-    echo "✓ added shell functions to $rc"
-  fi
-done
+# Upgrade from the old `ccs` name: drop its link and rc line.
+if [[ -L "$BIN_DIR/ccs" ]]; then rm "$BIN_DIR/ccs"; echo "✓ removed old ccs link"; fi
+touch "$RC"
+if grep -qF 'ccs shell-init' "$RC"; then
+  cp "$RC" "$RC.seat-bak"
+  grep -vF 'ccs shell-init' "$RC" | grep -vF '# ccs:' > "$RC.seat-tmp" && mv "$RC.seat-tmp" "$RC"
+  echo "✓ removed old ccs line from $RC (backup: $RC.seat-bak)"
+fi
+if ! grep -qF 'seat shell-init' "$RC"; then
+  printf '\n# seat: Claude seat per terminal/project (menu, limits, project rules)\n%s\n' "$INIT_LINE" >> "$RC"
+  echo "✓ added shell functions to $RC"
+fi
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "! $BIN_DIR is not on PATH; add to your shell rc: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+  *) echo "! $BIN_DIR is not on PATH; add to $RC: export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-for dep in python3 claude hermes; do
-  command -v "$dep" >/dev/null 2>&1 || echo "! $dep not found; install it before using ccs"
+"$BIN_DIR/seat" setup || true
+
+for dep in claude hermes; do
+  command -v "$dep" >/dev/null 2>&1 || echo "! $dep not found (optional, but seat manages it)"
 done
 
 cat <<'EOF'
 
 Next (open a new terminal first):
-  ccs init max you@personal.com      # name your existing Claude Code / Hermes login
-  ccs add work you@company.com       # each extra Claude account
-  ccs login work                     # browser login, email is verified
-  ccs status
+  seat init max you@gmail.com        # name the login you already have
+  seat add work you@company.com      # every other Claude seat
+  seat login work                    # browser login, email is verified
+  seat status
 EOF
