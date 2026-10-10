@@ -1,46 +1,65 @@
 # ccs
 
-Run Claude Code and Hermes under several Claude accounts side by side on one Mac
-(e.g. a personal Max plan in one terminal, a Team plan in another).
+Choose which Claude account Claude Code and Hermes use, per terminal. Example:
+personal Max (`tolgazorlu17@gmail.com`) in one terminal, a company Team seat
+(`tolga@viby.dev`) in another, and another Team seat in a third. Each terminal
+uses its own account's limits.
+
+## Setup (once)
+
+```sh
+ccs init max tolgazorlu17@gmail.com   # name the existing setup (~/.claude + default Hermes)
+ccs add viby tolga@viby.dev           # register another Claude account
+ccs login viby                        # browser login for Claude Code, then for Hermes
+ccs status                            # asks Anthropic which account each side is really using
+```
+
+`ccs login` checks that you logged in with the registered email. On a mismatch
+it logs out of / deletes that login.
+
+## Daily use
+
+Running `hermes` or `claude` asks:
+
+```
+Claude hesabı:
+  1) max      tolgazorlu17@gmail.com   (Enter)
+  2) viby     tolga@viby.dev
+Seçim:
+```
+
+The choice sticks to that terminal. Enter keeps the current one.
+
+- `ccs use <name>`: switch the terminal without the menu.
+- `export CCS_ASK=0`: turn the menu off.
+- Subcommands such as `hermes config` or `claude mcp` don't ask. They run on the
+  terminal's current account.
+
+Needs `eval "$(ccs shell-init)"` in `~/.zshrc`. That line defines the `hermes`,
+`claude` and `ccs` shell functions.
 
 ## How it works
 
-| Piece | Default account | Extra account `<name>` |
+| | default account (`max`) | other accounts `<name>` |
 |---|---|---|
-| Claude Code | `~/.claude` (`CLAUDE_CONFIG_DIR` unset) | `~/.claude-<name>` via `CLAUDE_CONFIG_DIR` |
-| Hermes | default profile, borrows the `~/.claude` login | profile `<name>` with its **own** Anthropic OAuth login, `auth.adopt_external_logins: false` |
-| Commands | `claude`, `hermes` | `claude-<name>`, `hermes-<name>` |
+| Claude Code | `~/.claude`, `CLAUDE_CONFIG_DIR` unset | `CLAUDE_CONFIG_DIR=~/.claude-<name>` |
+| Hermes | default profile, borrows the `~/.claude` login | `HERMES_HOME=~/.hermes/profiles/<name>`, with its own Claude OAuth login and `auth.adopt_external_logins: false` |
 
-Shared across accounts by symlink: Claude Code `CLAUDE.md`, `settings.json`,
-`commands`, `agents`, `skills`, `hooks`, `plugins`; Hermes `skills` and
-`memories` (use `ccs add <name> --isolated` to keep them separate).
-Not shared: logins, sessions/history, Hermes MCP OAuth tokens, `.env` (copied once).
+Shared through symlinks:
+- Claude Code: `CLAUDE.md`, settings, commands, agents, skills, hooks, plugins
+- Hermes: skills and memories
 
-Safety: `hermes-<name>` / `ccs use <name>` refuse to start Hermes unless the profile
-has its own Anthropic credential. A profile with zero Anthropic credentials reads
-the root profile's pool, which would silently bill the default account.
+Separate per account: logins, session history, Hermes MCP OAuth tokens.
+`.env` is copied once, at `ccs add` time.
 
-## Usage
-
-```sh
-ccs init max            # name the existing setup
-ccs add team            # create ~/.claude-team, Hermes profile "team", wrappers
-ccs login team          # browser login for Claude Code, then for Hermes (pick the Team org both times)
-ccs status              # asks Anthropic which account each side really uses
-
-claude-team             # Claude Code on Team
-hermes-team             # Hermes on Team
-ccs use team            # switch this terminal: plain `claude` and `hermes` now use Team
-ccs use max             # back
-ccs run team claude -c  # one-off
-```
-
-`ccs use` needs the shell function: `eval "$(ccs shell-init)"` in `~/.zshrc`.
+Safety: if a Hermes profile has no Claude credential of its own, Hermes falls back
+to the default profile's login and bills the Max account. ccs therefore won't start
+Hermes on an account until that account has its own login.
 
 ## Notes
 
-- Never set `CLAUDE_CONFIG_DIR=~/.claude` explicitly: Claude Code keys its Keychain
-  item on the variable, so the default account would look logged out.
-- Hermes cannot switch accounts inside a running session; start `hermes-<name>`
-  (or `ccs use <name>` then `hermes`) in another terminal.
-- Plain bash 3.2 + system python3; no build step. Install: `ln -s "$PWD/ccs" ~/.local/bin/ccs`.
+- Don't set `CLAUDE_CONFIG_DIR=~/.claude` yourself. Claude Code picks its Keychain
+  item based on that variable, so the default account would look logged out.
+- A running Hermes session can't change accounts. Open another terminal instead.
+- Written in bash 3.2 with the system python3, so there's nothing to build.
+  Install: `ln -s "$PWD/ccs" ~/.local/bin/ccs`.
