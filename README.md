@@ -8,6 +8,8 @@ terminal and each project. For example:
 - a company Team seat in another
 - a second Team seat in a third
 
+Status: active, used daily across multiple terminals and projects.
+
 ```
 $ hermes
 Claude hesabı (hermes):
