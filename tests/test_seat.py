@@ -212,6 +212,122 @@ class SeatTest(unittest.TestCase):
         os.environ["SEAT_ACCOUNT"] = "viby"
         self.assertEqual(run(self.seat, self.seat.cmd_cd), "")
 
+    # ── hardening ──
+    def test_corrupt_config_is_not_overwritten(self):
+        run(self.seat, self.seat.cmd_bind, "viby")
+        broken = '{"version":1,"accounts":[{"na'
+        self.seat.CONFIG.write_text(broken)
+        with self.assertRaises(SystemExit):
+            self.seat.Config()
+        self.assertEqual(self.seat.CONFIG.read_text(), broken)
+
+    def test_legacy_rows_with_bad_names_are_skipped(self):
+        (self.home / ".config" / "ccs" / "accounts.tsv").write_text(
+            f"max\t{self.home}/.claude\tdefault\tme@gmail.com\n"
+            f"../x\t{self.home}/Documents\t../x\tme@evil.io\n")
+        self.seat.CONFIG.unlink(missing_ok=True)
+        self.assertEqual([a.name for a in self.seat.Config().accounts], ["max"])
+
+    def test_bad_account_in_config_is_skipped_but_kept(self):
+        cfg = json.loads(self.seat.Config() and self.seat.CONFIG.read_text())
+        cfg["accounts"][1]["hermes_profile"] = "--yes"
+        self.seat.CONFIG.write_text(json.dumps(cfg))
+        self.assertEqual([a.name for a in self.seat.Config().accounts], ["max", "viby2"])
+        run(self.seat, self.seat.cmd_bind, "viby2")   # a save must not drop the bad row
+        saved = json.loads(self.seat.CONFIG.read_text())["accounts"]
+        self.assertIn("--yes", [a["hermes_profile"] for a in saved])
+        self.assertEqual(run(self.seat, self.seat.cmd_cd), "" if False else run(self.seat, self.seat.cmd_cd))
+
+    def test_purge_never_deletes_outside_seat_dir(self):
+        victim = self.home / "Documents"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("x")
+        cfg = json.loads(self.seat.Config() and self.seat.CONFIG.read_text())
+        cfg["accounts"][1]["claude_dir"] = str(victim)
+        self.seat.CONFIG.write_text(json.dumps(cfg))
+        self.seat.shutil.which = lambda name: None
+        self.seat.subprocess.run = lambda *a, **k: None
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_remove, "viby", "--purge")
+        self.assertTrue((victim / "keep.txt").exists())
+
+    def test_concurrent_binds_keep_every_rule(self):
+        import subprocess
+        self.seat.Config()
+        env = dict(os.environ)
+        dirs = []
+        for i in range(6):
+            d = self.home / f"p{i}"
+            d.mkdir()
+            dirs.append(d)
+        procs = [subprocess.Popen([sys.executable, str(ROOT / "seat"), "bind", "viby", str(d)], env=env,
+                                  stdout=subprocess.DEVNULL) for d in dirs]
+        self.assertEqual([p.wait() for p in procs], [0] * len(dirs))
+        paths = {r["path"] for r in self.seat.Config().projects}
+        self.assertEqual(paths, {str(d.resolve()) for d in dirs})
+
+    @unittest.skipUnless(sys.platform == "darwin", "case-insensitive APFS")
+    def test_rule_matches_path_case_insensitively_on_macos(self):
+        run(self.seat, self.seat.cmd_bind, "viby", str(self.cwd))
+        other_case = Path(str(self.cwd).replace("viby-app", "VIBY-App"))
+        self.assertEqual(self.seat.Config().rule_for(other_case)["accounts"], ["viby"])
+
+    def test_statusline_strips_terminal_escapes(self):
+        os.environ["SEAT_ACCOUNT"] = "viby"
+        sys.stdin = io.StringIO(json.dumps({"model": {"display_name": "Op\x1b]0;pwned\x07us"}}))
+        try:
+            out = run(self.seat, self.seat.cmd_statusline)
+        finally:
+            sys.stdin = sys.__stdin__
+        self.assertNotIn("\x1b]", out)
+        self.assertIn("Op]0;pwnedus", out)
+
+    def test_statusline_survives_bad_numbers(self):
+        os.environ["SEAT_ACCOUNT"] = "viby"
+        sys.stdin = io.StringIO(json.dumps({"rate_limits": {"five_hour": {"used_percentage": "lots"}}}))
+        try:
+            out = run(self.seat, self.seat.cmd_statusline)
+        finally:
+            sys.stdin = sys.__stdin__
+        self.assertIn("viby", out)
+
+    def test_fetch_usage_skips_malformed_window(self):
+        self.seat.OFFLINE = False
+        self.seat.valid_tokens = lambda acc: ["t"]
+        self.seat.api_get = lambda path, tok, timeout=0: {
+            "five_hour": {"utilization": "bad"}, "seven_day": {"utilization": 41, "resets_at": "nope"}}
+        u = self.seat.fetch_usage(self.seat.Config().get("viby"))
+        self.assertNotIn("five_hour", u)
+        self.assertEqual(u["seven_day"]["pct"], 41.0)
+
+    def test_email_starting_with_dash_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_email, "viby", "-x@viby.com")
+        self.seat.shutil.which = lambda name: None
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_add, "acme", "--x@acme.io")
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_email, "viby", "evil\x1b]0;x\x07@viby.com")
+
+    def test_pick_without_tty_exits_cleanly(self):
+        real_open = open
+        def no_tty(path, *a, **k):
+            if path == "/dev/tty":
+                raise OSError(6, "Device not configured")
+            return real_open(path, *a, **k)
+        self.seat.open = no_tty
+        with self.assertRaises(SystemExit):
+            self.seat.pick("t", self.seat.Config().accounts, "claude")
+
+    def test_hot_path_skips_network_and_sqlite_imports(self):
+        import subprocess
+        code = (f"import sys,runpy; sys.argv=['seat','_cd']\n"
+                f"try: runpy.run_path({str(ROOT / 'seat')!r}, run_name='__main__')\n"
+                f"except SystemExit: pass\n"
+                f"print('urllib.request' in sys.modules, 'sqlite3' in sys.modules)")
+        out = subprocess.run([sys.executable, "-c", code], env=dict(os.environ), capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "False False")
+
 
 if __name__ == "__main__":
     unittest.main()

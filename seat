@@ -16,12 +16,10 @@ import os
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +39,12 @@ LIMIT_PCT = 99.0     # at/above: treated as limited
 WARN_PCT = 90.0      # at/above: warn on launch
 USAGE_TTL = 90       # seconds a cached usage reading is considered fresh
 LIMIT_TEXT = re.compile(r"usage limit|hit your limit|rate[ _-]?limit|limit reached", re.I)
+NAME_RE = re.compile(r"[a-z][a-z0-9]{0,23}")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Default APFS is case-insensitive. Per-OS, not per-volume: a case-sensitive external volume
+# could match two paths that differ only in case to one rule.
+CASE_INSENSITIVE_FS = sys.platform == "darwin"
+WRITE_COMMANDS = {"init", "add", "email", "bind", "unbind", "remove", "rm"}
 
 
 # ── small utils ──────────────────────────────────────────────────────────────
@@ -60,6 +64,19 @@ def tty_write(text):
 
 def color(s, code):
     return s if os.environ.get("NO_COLOR") else f"\033[{code}m{s}\033[0m"
+
+
+def clean(s):
+    """Drop control characters (terminal escapes) from text that came from outside seat."""
+    return CONTROL_CHARS.sub("", s) if isinstance(s, str) else s
+
+
+def valid_email(s):
+    return isinstance(s, str) and "@" in s and not s.startswith("-") and not CONTROL_CHARS.search(s)
+
+
+def path_key(p):
+    return p.lower() if CASE_INSENSITIVE_FS else p
 
 
 def write_private(path, data):
@@ -124,6 +141,9 @@ class Account:
         self.claude_dir = Path(os.path.expanduser(d["claude_dir"]))
         self.hermes_profile = d.get("hermes_profile", self.name)
         self.isolated = bool(d.get("isolated", False))
+        if not NAME_RE.fullmatch(str(self.name)) or not (self.hermes_profile == "default"
+                                                          or NAME_RE.fullmatch(str(self.hermes_profile))):
+            raise ValueError(f"geçersiz hesap adı/profil: {self.name!r}/{self.hermes_profile!r}")
 
     def to_dict(self):
         return {"name": self.name, "email": self.email, "group": self.group,
@@ -176,8 +196,19 @@ class Config:
     def __init__(self):
         data = read_json(CONFIG)
         if data is None:
+            if CONFIG.exists():   # never reset a config we can't parse: that would drop every seat
+                die(f"{CONFIG} okunamadı (bozuk JSON?). Dosyayı düzelt ya da yedekle; seat onu sıfırlamaz.")
             data = self._bootstrap()
-        self.accounts = [Account(a) for a in data.get("accounts", [])]
+        self.accounts, self.invalid = [], []
+        for a in data.get("accounts", []):
+            try:
+                self.accounts.append(Account(a))
+            except (ValueError, KeyError, TypeError) as e:
+                # Skip just this seat (one bad row must not break claude/hermes) but keep it on save.
+                self.invalid.append(a)
+                sys.stderr.write(f"seat: {CONFIG}: bir hesap atlandı ({e})\n")
+        if not any(a.is_default for a in self.accounts):
+            die(f"{CONFIG}: varsayılan hesap (hermes_profile: default) yok ya da geçersiz")
         self.projects = data.get("projects", [])
         self.settings = data.get("settings", {})
 
@@ -187,7 +218,7 @@ class Config:
         if LEGACY_TSV.exists():   # migrate from ccs v0.2
             for line in LEGACY_TSV.read_text().splitlines():
                 cols = (line.split("\t") + ["", "", "", ""])[:4]
-                if cols[0]:
+                if NAME_RE.fullmatch(cols[0]) and (cols[2] == "default" or NAME_RE.fullmatch(cols[2])):
                     accounts.append({"name": cols[0], "claude_dir": cols[1], "hermes_profile": cols[2],
                                      "email": cols[3], "group": group_for(cols[3])})
         if not any(a["hermes_profile"] == "default" for a in accounts):
@@ -198,7 +229,7 @@ class Config:
         return data
 
     def save(self):
-        data = {"version": 1, "accounts": [a.to_dict() for a in self.accounts],
+        data = {"version": 1, "accounts": [a.to_dict() for a in self.accounts] + self.invalid,
                 "projects": self.projects, "settings": self.settings}
         write_private(CONFIG, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
@@ -231,10 +262,10 @@ class Config:
 
     def rule_for(self, cwd):
         """Longest path-boundary match among project rules, or None."""
-        cwd = str(Path(cwd).resolve())
+        cwd = path_key(str(Path(cwd).resolve()))
         best = None
         for r in self.projects:
-            p = r["path"].rstrip("/")
+            p = path_key(r["path"].rstrip("/"))
             if cwd == p or cwd.startswith(p + "/"):
                 if best is None or len(p) > len(best["path"]):
                     best = r
@@ -306,6 +337,7 @@ def valid_tokens(acc):
 
 
 def api_get(path, token, timeout=4.0):
+    import urllib.request   # lazy: keeps the cd hook and status line fast
     req = urllib.request.Request("https://api.anthropic.com" + path, headers={
         "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
         "Content-Type": "application/json", "User-Agent": f"seat/{VERSION}"})
@@ -319,9 +351,9 @@ def identity(acc, token=None):
     for tok in ([token] if token else valid_tokens(acc)):
         try:
             d = api_get("/api/oauth/profile", tok)
-            return {"email": (d.get("account") or {}).get("email"),
-                    "org": (d.get("organization") or {}).get("name"),
-                    "type": (d.get("organization") or {}).get("organization_type")}
+            return {"email": clean((d.get("account") or {}).get("email")),
+                    "org": clean((d.get("organization") or {}).get("name")),
+                    "type": clean((d.get("organization") or {}).get("organization_type"))}
         except Exception:
             continue
     return None
@@ -330,7 +362,7 @@ def identity(acc, token=None):
 def _iso(ts):
     try:
         return datetime.fromisoformat(ts).timestamp() if ts else None
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -358,8 +390,11 @@ def fetch_usage(acc):
         u = {"ts": now(), "src": "api"}
         for k in ("five_hour", "seven_day"):
             w = d.get(k) or {}
-            if w.get("utilization") is not None:
-                u[k] = {"pct": float(w["utilization"]), "resets": _iso(w.get("resets_at"))}
+            try:
+                if w.get("utilization") is not None:
+                    u[k] = {"pct": float(w["utilization"]), "resets": _iso(w.get("resets_at"))}
+            except (TypeError, ValueError, AttributeError):
+                continue
         cache_write(acc, u)
         return u
     return None
@@ -448,7 +483,11 @@ def pick(title, accounts, tool, default=None, usages=None):
         out = "" if first else f"\033[{len(lines)}A"
         return out + "".join(f"\r\033[2K{line}\n" for line in lines)
 
-    with open("/dev/tty", "r+b", buffering=0) as t:
+    try:
+        t = open("/dev/tty", "r+b", buffering=0)
+    except OSError:
+        die("hesap menüsü bir terminal ister; seçmek için: seat use <ad>")
+    with t:
         fd = t.fileno()
         old = termios.tcgetattr(fd)
         t.write(b"\033[?25l")
@@ -565,6 +604,7 @@ def last_hermes_session(acc, since):
     db = acc.hermes_home / "state.db"
     if not db.exists():
         return None
+    import sqlite3   # lazy: only the Hermes handoff needs it
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
         row = con.execute("select id from sessions where started_at >= ? and source in ('cli','tui') "
@@ -678,21 +718,30 @@ def cmd_statusline(cfg, args):
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     acc = cfg.current()
     rl = data.get("rate_limits") or {}
+    if not isinstance(rl, dict):
+        rl = {}
     if rl:
         u = {"ts": now(), "src": "statusline"}
         for k in ("five_hour", "seven_day"):
             w = rl.get(k) or {}
-            if w.get("used_percentage") is not None:
-                u[k] = {"pct": float(w["used_percentage"]), "resets": w.get("resets_at")}
+            try:
+                if w.get("used_percentage") is not None:
+                    r = w.get("resets_at")
+                    u[k] = {"pct": float(w["used_percentage"]), "resets": float(r) if r is not None else None}
+            except (TypeError, ValueError, AttributeError):
+                continue
         try:
             cache_write(acc, u)
         except OSError:
             pass
     else:
         u = cache_read(acc)
-    model = ((data.get("model") or {}).get("display_name")) or ""
+    model = data.get("model")
+    model = clean(str(model.get("display_name") or "")) if isinstance(model, dict) else ""
     parts = [color(acc.name, "1")]
     if model:
         parts.append(model)
@@ -743,6 +792,8 @@ def cmd_add(cfg, args):
         elif a == "--share":
             isolated = False
         elif "@" in a:
+            if not valid_email(a):
+                die(f"geçersiz email: {clean(a)!r}")
             email = a
         elif not a.startswith("-"):
             name = a
@@ -803,7 +854,7 @@ def cmd_add(cfg, args):
 def cmd_email(cfg, args):
     """Change the email a seat is verified against (logins made for the old email stay
     until you log in again)."""
-    if len(args) != 2 or "@" not in args[1]:
+    if len(args) != 2 or not valid_email(args[1]):
         die("kullanım: seat email <ad> <yeni-email>")
     acc = cfg.need(args[0])
     old, acc.email = acc.email, args[1]
@@ -816,6 +867,8 @@ def cmd_init(cfg, args):
     if not args:
         die("kullanım: seat init <ad> <email>")
     name, email = args[0], (args[1] if len(args) > 1 else "")
+    if email and not valid_email(email):
+        die(f"geçersiz email: {clean(email)!r}")
     if not re.fullmatch(r"[a-z][a-z0-9]{0,23}", name):
         die(f"ad küçük harf + rakam olmalı: '{name}'")
     d = cfg.default
@@ -974,7 +1027,7 @@ def cmd_bind(cfg, args):
     for n in names:
         cfg.need(n)
     path = str(Path(args[1] if len(args) > 1 else os.getcwd()).expanduser().resolve())
-    cfg.projects = [r for r in cfg.projects if r["path"] != path] + [{"path": path, "accounts": names}]
+    cfg.projects = [r for r in cfg.projects if path_key(r["path"]) != path_key(path)] + [{"path": path, "accounts": names}]
     cfg.save()
     print(f"✓ {path.replace(str(HOME), '~', 1)} → {', '.join(names)}"
           + ("" if len(names) > 1 else "   (limit dolunca geçilecek yedek yok; eklemek için: seat bind "
@@ -984,7 +1037,7 @@ def cmd_bind(cfg, args):
 def cmd_unbind(cfg, args):
     path = str(Path(args[0] if args else os.getcwd()).expanduser().resolve())
     before = len(cfg.projects)
-    cfg.projects = [r for r in cfg.projects if r["path"] != path]
+    cfg.projects = [r for r in cfg.projects if path_key(r["path"]) != path_key(path)]
     cfg.save()
     print("✓ kural silindi" if len(cfg.projects) < before else "bu klasörde kural yok")
 
@@ -1028,12 +1081,16 @@ def cmd_remove(cfg, args):
     acc = cfg.need(args[0])
     if acc.is_default:
         die("varsayılan hesap silinemez")
+    purge = "--purge" in args
+    expected = HOME / f".claude-{acc.name}"
+    if purge and acc.claude_dir.exists() and acc.claude_dir.resolve() != expected.resolve():
+        die(f"--purge yalnız {expected} siler; bu hesabın klasörü {acc.claude_dir}. Elle kontrol et.")
     cfg.accounts = [a for a in cfg.accounts if a.name != acc.name]
     for r in cfg.projects:
         r["accounts"] = [n for n in r["accounts"] if n != acc.name]
     cfg.projects = [r for r in cfg.projects if r["accounts"]]
     cfg.save()
-    if "--purge" in args:
+    if purge:
         for item in ("skills", "memories"):
             p = acc.hermes_home / item
             if p.is_symlink():
@@ -1208,6 +1265,14 @@ def main(argv):
     fn = COMMANDS.get(argv[0])
     if not fn:
         die(f"bilinmeyen komut: {argv[0]}  (seat help)")
+    if argv[0] in WRITE_COMMANDS:   # read-modify-write: serialize across terminals
+        import fcntl
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(CONFIG_DIR, 0o700)
+        with open(CONFIG_DIR / "config.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fn(Config(), argv[1:])
+        return
     fn(Config(), argv[1:])
 
 
