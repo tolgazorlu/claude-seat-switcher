@@ -1,5 +1,16 @@
 # claude-seat-switcher
 
+**Quick install:** paste this into Claude Code, Hermes or any coding agent on your Mac:
+
+```text
+Install claude-seat-switcher on this Mac. Clone https://github.com/tolgazorlu/claude-seat-switcher
+into ~/projects/claude-seat-switcher (git pull if it already exists) and run its install.sh.
+Then ask me which Claude accounts I use (a short name and the email for each), run
+`seat init <name> <email>` for the login I already have and `seat add <name> <email>` for the
+others, and finish with `seat doctor`. Do not run `seat login` yourself: it opens a browser, so
+give me the exact `seat login <name>` commands to run in a new terminal.
+```
+
 `seat` sets which Claude account ("seat") [Claude Code](https://code.claude.com) and
 [Hermes Agent](https://hermes-agent.nousresearch.com) use, separately for each
 terminal and each project. For example:
@@ -46,12 +57,12 @@ seat ▸ max · me@gmail.com · 5s %24 · 7g %36
 
 - macOS, `python3` (included with macOS), zsh
 - Claude Code and/or Hermes Agent
-- `gh`, logged in (this repo is private)
+- `git`
 
 ## Install
 
 ```sh
-gh repo clone tolgazorlu/claude-seat-switcher ~/projects/claude-seat-switcher
+git clone https://github.com/tolgazorlu/claude-seat-switcher ~/projects/claude-seat-switcher
 ~/projects/claude-seat-switcher/install.sh
 ```
 
