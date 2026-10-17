@@ -68,7 +68,17 @@ Config: `~/.config/seat/config.json`.
 - OAuth subscription logins are meant for Claude Code and Anthropic's own apps
   ([terms](https://code.claude.com/docs/en/legal-and-compliance)). On company seats, give
   Hermes an API key or ask the company first.
-- Rotating seats to get around limits breaks the usage policy, so `seat` always asks.
+
+## Why no automatic switching?
+
+Tools like claude-swap jump to another account on their own when one nears its limit.
+`seat` deliberately doesn't:
+
+- Rotating accounts to get around usage limits is a gray area under Anthropic's terms at
+  best, and the account risk lands on you (and on your company for Team seats).
+- A silent switch can move personal work onto a company seat, or the other way around.
+- You should know which account is spending. So `seat` asks once, offers only seats allowed
+  for the project, and you confirm with one key.
 
 Inspired by [clauth](https://github.com/uwuclxdy/clauth), [claude-code-account-switcher](https://github.com/Nemo-Illusionist/claude-code-account-switcher)
 and [cux](https://github.com/inulute/cux); no code copied. Tests: `python3 -m unittest discover -s tests`.
