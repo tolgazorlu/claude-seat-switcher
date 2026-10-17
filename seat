@@ -1106,7 +1106,7 @@ def cmd_doctor(cfg, args):
 
 
 SHELL_INIT = r'''
-# seat — Claude seat per terminal / project. https://github.com/tolgazorlu/claude-seat-switcher
+# seat — Claude seat per terminal / project. https://github.com/tolgazorlu/hermes-seats
 # SEAT_ASK=0: no menu at launch · SEAT_PROMPT=0: no prompt tag
 _seat_interactive() {   # $1 tool, rest args → 0 if this is an interactive session launch
   local tool="$1"; shift

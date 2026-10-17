@@ -1,10 +1,10 @@
-# claude-seat-switcher
+# hermes-seats
 
 **Quick install:** paste this into Claude Code, Hermes or any coding agent on your Mac:
 
 ```text
-Install claude-seat-switcher on this Mac. Clone https://github.com/tolgazorlu/claude-seat-switcher
-into ~/projects/claude-seat-switcher (git pull if it already exists) and run its install.sh.
+Install hermes-seats on this Mac. Clone https://github.com/tolgazorlu/hermes-seats
+into ~/projects/hermes-seats (git pull if it already exists) and run its install.sh.
 Then ask me which Claude accounts I use (a short name and the email for each), run
 `seat init <name> <email>` for the login I already have and `seat add <name> <email>` for the
 others, and finish with `seat doctor`. Do not run `seat login` yourself: it opens a browser, so
@@ -62,8 +62,8 @@ seat ▸ max · me@gmail.com · 5s %24 · 7g %36
 ## Install
 
 ```sh
-git clone https://github.com/tolgazorlu/claude-seat-switcher ~/projects/claude-seat-switcher
-~/projects/claude-seat-switcher/install.sh
+git clone https://github.com/tolgazorlu/hermes-seats ~/projects/hermes-seats
+~/projects/hermes-seats/install.sh
 ```
 
 The installer:
@@ -71,7 +71,7 @@ The installer:
 - adds `eval "$(seat shell-init)"` to `~/.zshrc`
 - installs the Claude Code status line (backing up `settings.json` first)
 
-Open a new terminal afterwards. To update: `git -C ~/projects/claude-seat-switcher pull`.
+Open a new terminal afterwards. To update: `git -C ~/projects/hermes-seats pull`.
 
 ## Setup
 
@@ -130,8 +130,6 @@ refreshing one would sign Claude Code out.
 - Rotating between seats to systematically get around limits goes against the usage
   policy. That's why `seat` always asks and only offers seats that are allowed for
   the project.
-- Before making this repo public, the name needs to change: the Claude name can't be
-  used in a product name.
 
 ## Credits
 
