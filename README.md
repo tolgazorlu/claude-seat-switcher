@@ -44,7 +44,8 @@ Update with `git -C ~/projects/hermes-seats pull`.
   carries the session over. It never switches on its own, and never moves personal work
   onto a company seat.
 - **Isolation:** each extra seat has its own Claude config dir, Hermes profile and login.
-  Company seats get no personal memories or API keys.
+  Company seats get their own Hermes memories and no personal Hermes API keys; Claude Code
+  settings, hooks and skills stay shared.
 
 ## Commands
 
