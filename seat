@@ -1333,8 +1333,9 @@ Günlük:
 
 Limit dolunca: hermes/claude kapanınca seat sorar, onaylarsan aynı oturuma diğer hesapla devam eder.
 seat auto on: menü yok, sıradaki ilk uygun hesapla açılır; %95'te sormadan sıradakine geçer.
-Her iki durumda yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler (kişisel iş şirket
-hesabına kaymaz). Tek terminal için: SEAT_AUTO=0 / SEAT_AUTO=1.
+Açılışta o projeye izinli hesaplar; kural yoksa mevcut hesabın grubu, o grupta görünür hesap
+yoksa sıradaki tüm görünür hesaplar. Oturum devri (seat _after) hiçbir zaman grup değiştirmez.
+Tek terminal için: SEAT_AUTO=0 / SEAT_AUTO=1.
 """
 
 COMMANDS = {
