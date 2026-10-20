@@ -34,13 +34,17 @@ LEGACY_TSV = HOME / ".config" / "ccs" / "accounts.tsv"
 OFFLINE = os.environ.get("SEAT_OFFLINE") == "1"   # tests: never touch the network
 
 
-def auto_mode():
-    """SEAT_AUTO=0 brings back the launch menu and the confirm-before-switch prompt."""
-    return os.environ.get("SEAT_AUTO", "1") != "0"
+def auto_mode(cfg):
+    """Opt-in (seat auto on). SEAT_AUTO=0/1 overrides the setting for one terminal."""
+    env = os.environ.get("SEAT_AUTO")
+    if env in ("0", "1"):
+        return env == "1"
+    return bool(cfg.settings.get("auto"))
 SHARED_CLAUDE_ITEMS = ["CLAUDE.md", "settings.json", "commands", "agents", "skills", "hooks", "plugins", "output-styles"]
 PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "icloud.com", "me.com", "outlook.com", "hotmail.com",
                     "live.com", "yahoo.com", "proton.me", "protonmail.com", "yandex.com"}
-LIMIT_PCT = 95.0     # at/above: treated as limited, seat moves on to the next seat
+LIMIT_PCT = 99.0     # at/above: treated as limited (set per config in Config())
+AUTO_LIMIT_PCT = 95.0   # auto mode: a seat this full hands over to the next one
 WARN_PCT = 90.0      # at/above: warn on launch
 USAGE_TTL = 90       # seconds a cached usage reading is considered fresh
 LIMIT_TEXT = re.compile(r"usage limit|hit your limit|rate[ _-]?limit|limit reached", re.I)
@@ -49,7 +53,7 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Default APFS is case-insensitive. Per-OS, not per-volume: a case-sensitive external volume
 # could match two paths that differ only in case to one rule.
 CASE_INSENSITIVE_FS = sys.platform == "darwin"
-WRITE_COMMANDS = {"init", "add", "email", "bind", "unbind", "remove", "rm", "rename", "order"}
+WRITE_COMMANDS = {"init", "add", "email", "bind", "unbind", "remove", "rm", "rename", "order", "auto"}
 
 
 # ── small utils ──────────────────────────────────────────────────────────────
@@ -218,6 +222,8 @@ class Config:
             die(f"{CONFIG}: varsayılan hesap (hermes_profile: default) yok ya da geçersiz")
         self.projects = data.get("projects", [])
         self.settings = data.get("settings", {})
+        global LIMIT_PCT
+        LIMIT_PCT = AUTO_LIMIT_PCT if auto_mode(self) else 99.0
 
     @staticmethod
     def _bootstrap():
@@ -572,7 +578,7 @@ def cmd_launch(cfg, args):
     else:
         if not cfg.visible:
             die("görünür hesap yok: seat add <ad> <email>")
-        if auto_mode():
+        if auto_mode(cfg):
             chain = cfg.allowed(cwd, cur) or cfg.visible
             usages = usage_for(chain)
             pin = cfg.get(os.environ.get("SEAT_PIN") or "")
@@ -688,7 +694,7 @@ def cmd_after(cfg, args):
     cands = [a for a in cfg.allowed(cwd, cur) if a.name != cur.name and ready(a, tool)]
     usages = usage_for(cands)
     cands = [a for a in cands if not is_limited(usages.get(a.name))]   # priority order
-    auto = auto_mode()
+    auto = auto_mode(cfg)
     if not auto:
         cands.sort(key=lambda a: (window(usages.get(a.name), "five_hour")[0] or 0))
     tty_write("\n" + color(f"⚠ {cur.name} limiti doldu ({reason}).", "33") + "\n")
@@ -925,6 +931,18 @@ def cmd_order(cfg, args):
         cfg.accounts = accs + [a for a in cfg.accounts if a not in accs]
         cfg.save()
     print("sıra: " + " → ".join(f"{i + 1}) {a.name}" for i, a in enumerate(cfg.visible)))
+
+
+def cmd_auto(cfg, args):
+    if args and args[0] in ("on", "off"):
+        cfg.settings["auto"] = args[0] == "on"
+        cfg.save()
+    elif args:
+        die("kullanım: seat auto [on|off]")
+    if cfg.settings.get("auto"):
+        print("otomatik geçiş: açık · açılışta sıradaki ilk uygun hesap, %95'te sormadan sıradakine geçer")
+    else:
+        print("otomatik geçiş: kapalı · açılışta menü, limit dolunca sorar (açmak için: seat auto on)")
 
 
 def cmd_init(cfg, args):
@@ -1233,7 +1251,7 @@ def cmd_doctor(cfg, args):
 
 SHELL_INIT = r'''
 # seat — Claude seat per terminal / project. https://github.com/tolgazorlu/hermes-seats
-# SEAT_ASK=0: no seat choice at launch · SEAT_AUTO=0: menu + confirm instead of auto order · SEAT_PROMPT=0: no prompt tag
+# SEAT_ASK=0: no seat choice at launch · SEAT_AUTO=0/1: override `seat auto` · SEAT_PROMPT=0: no prompt tag
 _seat_interactive() {   # $1 tool, rest args → 0 if this is an interactive session launch
   local tool="$1"; shift
   [ -t 0 ] && [ -t 1 ] || return 1
@@ -1302,7 +1320,8 @@ Kurulum:
 
 Günlük:
   hermes / claude                      açılışta hesap menüsü (↑↓ Enter); proje kuralı varsa sormaz
-  seat use <ad>                        bu terminali o hesaba sabitle (limit dolana kadar)
+  seat use <ad>                        bu terminali o hesaba geçir
+  seat auto on|off                     otomatik sıralı geçiş (varsayılan kapalı)
   seat order viby,tolga,support        öncelik sırası: önce 1., limiti dolunca 2., sonra 3.
   seat rename <eski> <yeni>            hesabın adını değiştir (giriş/oturumlar korunur)
   seat bind work,work2 [klasör]        bu projede work kullan, limit dolunca work2'ye geçmeyi öner
@@ -1310,13 +1329,14 @@ Günlük:
   seat status · seat usage [--refresh] · seat list · seat doctor
   seat remove <ad> [--purge]
 
-Limit %95'e gelince/dolunca: hermes/claude kapanınca seat sormadan sıradaki hesaba geçer ve aynı
-oturuma devam eder (yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler, kişisel iş şirket
-hesabına kaymaz). Eski davranış (menü + onay): SEAT_AUTO=0.
+Limit dolunca: hermes/claude kapanınca seat sorar, onaylarsan aynı oturuma diğer hesapla devam eder.
+seat auto on: menü yok, sıradaki ilk uygun hesapla açılır; %95'te sormadan sıradakine geçer.
+Her iki durumda yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler (kişisel iş şirket
+hesabına kaymaz). Tek terminal için: SEAT_AUTO=0 / SEAT_AUTO=1.
 """
 
 COMMANDS = {
-    "init": cmd_init, "add": cmd_add, "rename": cmd_rename, "order": cmd_order, "email": cmd_email, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
+    "init": cmd_init, "add": cmd_add, "rename": cmd_rename, "order": cmd_order, "auto": cmd_auto, "email": cmd_email, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
     "bind": cmd_bind, "unbind": cmd_unbind, "projects": cmd_projects, "list": cmd_list, "ls": cmd_list,
     "env": cmd_env, "remove": cmd_remove, "rm": cmd_remove, "setup": cmd_setup, "doctor": cmd_doctor,
     "shell-init": cmd_shell_init, "statusline": cmd_statusline,
