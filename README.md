@@ -44,7 +44,7 @@ Update with `git -C ~/projects/hermes-seats pull`.
 - **Status line:** `work · Opus · 5s 23% · 7g 41%` inside Claude Code.
 - **Limit handoff:** when a session ends on a seat out of limit, `seat` asks before moving to
   another allowed seat and resumes the same session. In auto mode it moves to the next seat
-  in order at 95% without asking. It never moves personal work onto a company seat.
+  in order at 95% without asking. A handoff never moves a session to another group.
 - **Isolation:** each extra seat has its own Claude config dir, Hermes profile and login.
   Company seats get their own Hermes memories and no personal Hermes API keys; Claude Code
   settings, hooks and skills stay shared.
@@ -76,7 +76,9 @@ Config: `~/.config/seat/config.json`.
 ## About automatic switching
 
 Off by default; `seat auto on` turns it on. Even then it switches only when a session ends,
-never mid-request, and only between seats allowed for the project (or the same group).
+never mid-request. Launch uses the seats allowed for the project; with no project rule it
+uses the current seat's group, or every visible seat in order when that group has none.
+A mid-session handoff (`seat _after`) never crosses groups.
 Keep in mind:
 
 - Rotating accounts to get around usage limits is a gray area under Anthropic's terms at
