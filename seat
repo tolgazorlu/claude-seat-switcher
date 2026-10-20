@@ -32,10 +32,15 @@ HERMES_ROOT = Path(os.environ.get("SEAT_HERMES_ROOT", HOME / ".hermes"))
 DEFAULT_CLAUDE_DIR = HOME / ".claude"
 LEGACY_TSV = HOME / ".config" / "ccs" / "accounts.tsv"
 OFFLINE = os.environ.get("SEAT_OFFLINE") == "1"   # tests: never touch the network
+
+
+def auto_mode():
+    """SEAT_AUTO=0 brings back the launch menu and the confirm-before-switch prompt."""
+    return os.environ.get("SEAT_AUTO", "1") != "0"
 SHARED_CLAUDE_ITEMS = ["CLAUDE.md", "settings.json", "commands", "agents", "skills", "hooks", "plugins", "output-styles"]
 PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "icloud.com", "me.com", "outlook.com", "hotmail.com",
                     "live.com", "yahoo.com", "proton.me", "protonmail.com", "yandex.com"}
-LIMIT_PCT = 99.0     # at/above: treated as limited
+LIMIT_PCT = 95.0     # at/above: treated as limited, seat moves on to the next seat
 WARN_PCT = 90.0      # at/above: warn on launch
 USAGE_TTL = 90       # seconds a cached usage reading is considered fresh
 LIMIT_TEXT = re.compile(r"usage limit|hit your limit|rate[ _-]?limit|limit reached", re.I)
@@ -44,7 +49,7 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Default APFS is case-insensitive. Per-OS, not per-volume: a case-sensitive external volume
 # could match two paths that differ only in case to one rule.
 CASE_INSENSITIVE_FS = sys.platform == "darwin"
-WRITE_COMMANDS = {"init", "add", "email", "bind", "unbind", "remove", "rm"}
+WRITE_COMMANDS = {"init", "add", "email", "bind", "unbind", "remove", "rm", "rename", "order"}
 
 
 # ── small utils ──────────────────────────────────────────────────────────────
@@ -567,6 +572,17 @@ def cmd_launch(cfg, args):
     else:
         if not cfg.visible:
             die("görünür hesap yok: seat add <ad> <email>")
+        if auto_mode():
+            chain = cfg.allowed(cwd, cur) or cfg.visible
+            usages = usage_for(chain)
+            pin = cfg.get(os.environ.get("SEAT_PIN") or "")
+            good = [a for a in chain if ready(a, tool) and not is_limited(usages.get(a.name))]
+            choice = pin if pin in good else (good[0] if good else None)
+            if choice:
+                why = "seat use" if choice is pin else "sıra: " + " → ".join(a.name for a in chain)
+                announce(choice, usages.get(choice.name), why)
+                print(choice.env_script())
+                return
         usages = usage_for(cfg.visible)
         acc = pick(f"Claude hesabı ({tool}):", cfg.visible, tool, cur, usages)
     if acc is None:
@@ -671,15 +687,19 @@ def cmd_after(cfg, args):
     reason = limit_summary(u) or "limit hatası"
     cands = [a for a in cfg.allowed(cwd, cur) if a.name != cur.name and ready(a, tool)]
     usages = usage_for(cands)
-    cands = sorted([a for a in cands if not is_limited(usages.get(a.name))],
-                   key=lambda a: (window(usages.get(a.name), "five_hour")[0] or 0))
+    cands = [a for a in cands if not is_limited(usages.get(a.name))]   # priority order
+    auto = auto_mode()
+    if not auto:
+        cands.sort(key=lambda a: (window(usages.get(a.name), "five_hour")[0] or 0))
     tty_write("\n" + color(f"⚠ {cur.name} limiti doldu ({reason}).", "33") + "\n")
     if not cands:
         rule = cfg.rule_for(cwd)
         scope = "bu proje" if rule else f"'{cur.group}' grubu"
         tty_write(f"  {scope} için geçilebilecek başka hesap yok. Proje kuralı: seat bind <hesap,...>\n")
         return
-    if len(cands) == 1:
+    if auto:
+        target = cands[0]
+    elif len(cands) == 1:
         target = cands[0]
         p5 = window(usages.get(target.name), "five_hour")[0]
         extra = f" · 5s %{p5:.0f}" if p5 is not None else ""
@@ -869,6 +889,42 @@ def cmd_email(cfg, args):
     cfg.save()
     print(f"✓ {acc.name}: {old or '?'} → {acc.email} (grup: {acc.group})")
     print(f"  Bu hesapla yeniden giriş yap: seat login {acc.name}")
+
+
+def cmd_rename(cfg, args):
+    """Rename a seat. Its Claude config dir and Hermes profile keep their paths, so logins
+    and sessions stay where they are."""
+    if len(args) != 2:
+        die("kullanım: seat rename <eski> <yeni>")
+    acc, new = cfg.need(args[0]), args[1]
+    if not NAME_RE.fullmatch(new):
+        die(f"ad küçük harf + rakam olmalı: '{clean(new)}'")
+    if cfg.get(new):
+        die(f"'{new}' adı zaten kullanılıyor")
+    old_cache = cache_path(acc)
+    old, acc.name = acc.name, new
+    for r in cfg.projects:
+        r["accounts"] = [new if n == old else n for n in r["accounts"]]
+    cfg.save()
+    try:
+        old_cache.rename(cache_path(acc))
+    except OSError:
+        pass
+    print(f"✓ {old} → {new} (Claude: {str(acc.claude_dir).replace(str(HOME), '~', 1)}, Hermes profili: {acc.hermes_profile} aynı kaldı)")
+    print("  Açık terminallerde eski ad görünebilir; yeni terminal aç ya da: seat use " + new)
+
+
+def cmd_order(cfg, args):
+    """Priority order: launch picks the first seat with limit left, and a seat at the limit
+    hands the session to the next one."""
+    if args:
+        names = [n for n in args[0].split(",") if n]
+        if len(set(names)) != len(names):
+            die("bir hesap iki kez yazılmış")
+        accs = [cfg.need(n) for n in names]
+        cfg.accounts = accs + [a for a in cfg.accounts if a not in accs]
+        cfg.save()
+    print("sıra: " + " → ".join(f"{i + 1}) {a.name}" for i, a in enumerate(cfg.visible)))
 
 
 def cmd_init(cfg, args):
@@ -1177,7 +1233,7 @@ def cmd_doctor(cfg, args):
 
 SHELL_INIT = r'''
 # seat — Claude seat per terminal / project. https://github.com/tolgazorlu/hermes-seats
-# SEAT_ASK=0: no menu at launch · SEAT_PROMPT=0: no prompt tag
+# SEAT_ASK=0: no seat choice at launch · SEAT_AUTO=0: menu + confirm instead of auto order · SEAT_PROMPT=0: no prompt tag
 _seat_interactive() {   # $1 tool, rest args → 0 if this is an interactive session launch
   local tool="$1"; shift
   [ -t 0 ] && [ -t 1 ] || return 1
@@ -1217,7 +1273,7 @@ claude() { _seat_run claude "$@"; }
 seat() {
   if [ "$1" = use ]; then
     local _e; _e="$(command seat env "${2:?kullanım: seat use <ad>}")" || return 1
-    eval "$_e" && echo "seat ▸ bu terminal artık '$2' hesabında (claude + hermes)"
+    eval "$_e" && export SEAT_PIN="$2" && echo "seat ▸ bu terminal artık '$2' hesabında (claude + hermes)"
   else command seat "$@"; fi
 }
 _seat_cd() { local _e; _e="$(command seat _cd 2>/dev/null)" && [ -n "$_e" ] && eval "$_e"; }
@@ -1246,18 +1302,21 @@ Kurulum:
 
 Günlük:
   hermes / claude                      açılışta hesap menüsü (↑↓ Enter); proje kuralı varsa sormaz
-  seat use <ad>                        bu terminali o hesaba geçir
+  seat use <ad>                        bu terminali o hesaba sabitle (limit dolana kadar)
+  seat order viby,tolga,support        öncelik sırası: önce 1., limiti dolunca 2., sonra 3.
+  seat rename <eski> <yeni>            hesabın adını değiştir (giriş/oturumlar korunur)
   seat bind work,work2 [klasör]        bu projede work kullan, limit dolunca work2'ye geçmeyi öner
   seat unbind [klasör] · seat projects
   seat status · seat usage [--refresh] · seat list · seat doctor
   seat remove <ad> [--purge]
 
-Limit dolunca: hermes/claude kapanınca seat sorar, onaylarsan aynı oturuma diğer hesapla devam eder
-(yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler — kişisel iş şirket hesabına kaymaz).
+Limit %95'e gelince/dolunca: hermes/claude kapanınca seat sormadan sıradaki hesaba geçer ve aynı
+oturuma devam eder (yalnız o projeye izinli hesaplar; kural yoksa aynı gruptakiler, kişisel iş şirket
+hesabına kaymaz). Eski davranış (menü + onay): SEAT_AUTO=0.
 """
 
 COMMANDS = {
-    "init": cmd_init, "add": cmd_add, "email": cmd_email, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
+    "init": cmd_init, "add": cmd_add, "rename": cmd_rename, "order": cmd_order, "email": cmd_email, "login": cmd_login, "status": cmd_status, "usage": cmd_usage,
     "bind": cmd_bind, "unbind": cmd_unbind, "projects": cmd_projects, "list": cmd_list, "ls": cmd_list,
     "env": cmd_env, "remove": cmd_remove, "rm": cmd_remove, "setup": cmd_setup, "doctor": cmd_doctor,
     "shell-init": cmd_shell_init, "statusline": cmd_statusline,

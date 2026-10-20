@@ -199,6 +199,69 @@ class SeatTest(unittest.TestCase):
         self.set_usage("viby", 40)
         self.assertEqual(run(self.seat, self.seat.cmd_after, "claude", str(time.time() - 30)), "")
 
+    def add_viby3(self):
+        self.seat.shutil.which = lambda name: None
+        run(self.seat, self.seat.cmd_add, "viby3", "me3@viby.dev")
+
+    def test_after_switches_to_next_seat_in_order_without_asking(self):
+        self.add_viby3()
+        for n in ("viby", "viby2", "viby3"):
+            self.login_claude(n)
+        run(self.seat, self.seat.cmd_order, "viby3,viby,viby2")
+        os.environ["SEAT_ACCOUNT"] = "viby3"
+        self.write_transcript(self.home / ".claude-viby3", [{"type": "assistant", "message": {}}])
+        self.set_usage("viby3", 96)            # near the limit counts as full
+        self.set_usage("viby", 80)             # more used than viby2, still next in order
+        self.set_usage("viby2", 5)
+        self.seat.confirm = lambda *a, **k: self.fail("auto mode must not ask")
+        self.seat.pick = lambda *a, **k: self.fail("auto mode must not show a menu")
+        out = run(self.seat, self.seat.cmd_after, "claude", str(time.time() - 30))
+        self.assertIn(f"CLAUDE_CONFIG_DIR={self.home}/.claude-viby ", out + " ")
+        self.assertIn("set -- --resume abc-123", out)
+
+    def test_after_asks_when_auto_is_off(self):
+        for n in ("viby", "viby2"):
+            self.login_claude(n)
+        os.environ.update({"SEAT_ACCOUNT": "viby", "SEAT_AUTO": "0"})
+        self.write_transcript(self.home / ".claude-viby", [{"type": "assistant", "message": {}}])
+        self.set_usage("viby", 100)
+        self.set_usage("viby2", 0)
+        asked = []
+        self.seat.confirm = lambda q, default_yes=True: asked.append(q) or False
+        self.assertEqual(run(self.seat, self.seat.cmd_after, "claude", str(time.time() - 30)), "")
+        self.assertEqual(len(asked), 1)
+
+    def test_launch_picks_first_seat_with_limit_left(self):
+        for n in ("viby", "viby2"):
+            self.login_claude(n)
+        run(self.seat, self.seat.cmd_remove, "max")
+        self.set_usage("viby", 97)
+        self.set_usage("viby2", 10)
+        self.seat.pick = lambda *a, **k: self.fail("auto mode must not show a menu")
+        out = run(self.seat, self.seat.cmd_launch, "claude")
+        self.assertIn(f"{self.home}/.claude-viby2", out)
+        self.set_usage("viby", 20)             # window reset: back to seat 1
+        out = run(self.seat, self.seat.cmd_launch, "claude")
+        self.assertIn(f"{self.home}/.claude-viby ", out + " ")
+        os.environ["SEAT_PIN"] = "viby2"       # seat use viby2 sticks while it has limit left
+        self.assertIn(f"{self.home}/.claude-viby2", run(self.seat, self.seat.cmd_launch, "claude"))
+
+    def test_order_and_rename(self):
+        run(self.seat, self.seat.cmd_bind, "viby,viby2")
+        self.set_usage("viby2", 33)
+        out = run(self.seat, self.seat.cmd_order, "viby2,viby")
+        self.assertIn("1) viby2", out)
+        run(self.seat, self.seat.cmd_rename, "viby2", "tolga")
+        cfg = self.seat.Config()
+        acc = cfg.get("tolga")
+        self.assertEqual([a.name for a in cfg.accounts], ["tolga", "viby", "max"])
+        self.assertEqual(acc.claude_dir, self.home / ".claude-viby2")
+        self.assertEqual(acc.hermes_profile, "viby2")
+        self.assertEqual(cfg.projects[0]["accounts"], ["viby", "tolga"])
+        self.assertEqual(self.seat.cache_read(acc)["five_hour"]["pct"], 33)
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_rename, "tolga", "viby")
+
     def test_guard_blocks_hermes_on_seat_without_own_login(self):
         os.environ["SEAT_ACCOUNT"] = "viby"
         with self.assertRaises(SystemExit):
