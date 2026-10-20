@@ -141,6 +141,7 @@ class Account:
         self.claude_dir = Path(os.path.expanduser(d["claude_dir"]))
         self.hermes_profile = d.get("hermes_profile", self.name)
         self.isolated = bool(d.get("isolated", False))
+        self.hidden = bool(d.get("hidden", False))   # default seat can't be deleted, only hidden
         if not NAME_RE.fullmatch(str(self.name)) or not (self.hermes_profile == "default"
                                                           or NAME_RE.fullmatch(str(self.hermes_profile))):
             raise ValueError(f"geçersiz hesap adı/profil: {self.name!r}/{self.hermes_profile!r}")
@@ -148,7 +149,8 @@ class Account:
     def to_dict(self):
         return {"name": self.name, "email": self.email, "group": self.group,
                 "claude_dir": str(self.claude_dir).replace(str(HOME), "~", 1),
-                "hermes_profile": self.hermes_profile, "isolated": self.isolated}
+                "hermes_profile": self.hermes_profile, "isolated": self.isolated,
+                **({"hidden": True} if self.hidden else {})}
 
     @property
     def is_default(self):
@@ -249,6 +251,10 @@ class Config:
     def default(self):
         return next(a for a in self.accounts if a.is_default)
 
+    @property
+    def visible(self):
+        return [a for a in self.accounts if not a.hidden]
+
     def current(self):
         name = os.environ.get("SEAT_ACCOUNT") or os.environ.get("CCS_ACCOUNT")
         if name and self.get(name):
@@ -276,8 +282,8 @@ class Config:
         current seat's group (a personal project never spills onto a company seat)."""
         rule = self.rule_for(cwd)
         if rule:
-            return [a for a in (self.get(n) for n in rule["accounts"]) if a]
-        return [a for a in self.accounts if a.group == current.group]
+            return [a for a in (self.get(n) for n in rule["accounts"]) if a and not a.hidden]
+        return [a for a in self.visible if a.group == current.group]
 
 
 # ── login state (cheap, local) ───────────────────────────────────────────────
@@ -559,8 +565,10 @@ def cmd_launch(cfg, args):
             return
         acc = pick(f"Bu proje için Claude hesabı ({tool}):", allowed, tool, cur, usages)
     else:
-        usages = usage_for(cfg.accounts)
-        acc = pick(f"Claude hesabı ({tool}):", cfg.accounts, tool, cur, usages)
+        if not cfg.visible:
+            die("görünür hesap yok: seat add <ad> <email>")
+        usages = usage_for(cfg.visible)
+        acc = pick(f"Claude hesabı ({tool}):", cfg.visible, tool, cur, usages)
     if acc is None:
         sys.exit(1)
     announce(acc, usages.get(acc.name))
@@ -877,7 +885,7 @@ def cmd_init(cfg, args):
         die(f"'{name}' başka bir hesabın adı")
     for r in cfg.projects:
         r["accounts"] = [name if n == d.name else n for n in r["accounts"]]
-    d.name = name
+    d.name, d.hidden = name, False
     if email:
         d.email, d.group = email, group_for(email)
     cfg.save()
@@ -1055,7 +1063,7 @@ def cmd_list(cfg, args):
     for a in cfg.accounts:
         mark = "*" if a.name == cur.name else " "
         print(f"{mark} {a.name:<8} {a.email or '?':<28} {a.group:<9} claude:{str(a.claude_dir).replace(str(HOME), '~', 1):<16} hermes:{a.hermes_profile}"
-              + ("  (izole)" if a.isolated else ""))
+              + ("  (izole)" if a.isolated else "") + ("  (gizli)" if a.hidden else ""))
 
 
 def cmd_guard(cfg, args):
@@ -1080,7 +1088,12 @@ def cmd_remove(cfg, args):
         die("kullanım: seat remove <ad> [--purge]")
     acc = cfg.need(args[0])
     if acc.is_default:
-        die("varsayılan hesap silinemez")
+        if "--purge" in args:
+            die("varsayılan hesap (~/.claude + Hermes default) silinemez, yalnız menüden gizlenir: seat remove " + acc.name)
+        acc.hidden = True
+        cfg.save()
+        print(f"✓ {acc.name} menüden gizlendi (varsayılan hesap silinmez; geri almak için: seat init {acc.name})")
+        return
     purge = "--purge" in args
     expected = HOME / f".claude-{acc.name}"
     if purge and acc.claude_dir.exists() and acc.claude_dir.resolve() != expected.resolve():

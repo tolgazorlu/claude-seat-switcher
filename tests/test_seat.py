@@ -92,6 +92,16 @@ class SeatTest(unittest.TestCase):
         self.assertEqual([a.name for a in cfg.allowed(self.home, cfg.get("max"))], ["max"])
         self.assertEqual([a.name for a in cfg.allowed(self.home, cfg.get("viby"))], ["viby", "viby2"])
 
+    def test_remove_default_hides_it_and_init_restores(self):
+        out = run(self.seat, self.seat.cmd_remove, "max")
+        self.assertIn("gizlendi", out)
+        cfg = self.seat.Config()
+        self.assertTrue(cfg.get("max").hidden)
+        self.assertEqual([a.name for a in cfg.visible], ["viby", "viby2"])
+        self.assertEqual(cfg.allowed(self.home, cfg.get("max")), [])
+        run(self.seat, self.seat.cmd_init, "max")
+        self.assertFalse(self.seat.Config().get("max").hidden)
+
     def test_env_script(self):
         cfg = self.seat.Config()
         self.assertIn("unset CLAUDE_CONFIG_DIR HERMES_HOME", cfg.get("max").env_script())
