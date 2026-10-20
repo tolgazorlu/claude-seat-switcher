@@ -37,14 +37,14 @@ Update with `git -C ~/projects/hermes-seats pull`.
 
 ## Features
 
-- **Priority order:** `seat order a,b,c` sets the chain. `claude` and `hermes` start on the
-  first seat with limit left (under 95% of the 5h and 7d windows); `seat use <name>` pins one.
+- **Launch menu:** `claude` and `hermes` ask which seat, with live 5h / 7d limit bars.
+- **Auto mode (opt-in):** `seat auto on` replaces the menu with the priority chain from
+  `seat order a,b,c`: start on the first seat under 95%; `seat use <name>` pins one.
 - **Project rules:** `seat bind work,work2` makes a folder use `work`; `cd` switches the terminal.
 - **Status line:** `work · Opus · 5s 23% · 7g 41%` inside Claude Code.
-- **Limit handoff:** when the session ends on a seat at 95% or more (or on a limit error),
-  `seat` moves to the next allowed seat in order without asking and resumes the same session.
-  It never moves personal work onto a company seat. `SEAT_AUTO=0` brings back the launch menu
-  and the confirm prompt.
+- **Limit handoff:** when a session ends on a seat out of limit, `seat` asks before moving to
+  another allowed seat and resumes the same session. In auto mode it moves to the next seat
+  in order at 95% without asking. It never moves personal work onto a company seat.
 - **Isolation:** each extra seat has its own Claude config dir, Hermes profile and login.
   Company seats get their own Hermes memories and no personal Hermes API keys; Claude Code
   settings, hooks and skills stay shared.
@@ -56,9 +56,9 @@ Update with `git -C ~/projects/hermes-seats pull`.
 | `seat use <name>` | switch this terminal |
 | `seat bind a,b [dir]` · `unbind` · `projects` | project rules (first = default) |
 | `seat status` · `whoami` · `usage` | logins, current account, limit bars |
-| `seat order a,b,c` · `rename <old> <new>` | priority chain, rename (logins kept) |
+| `seat auto on\|off` · `order a,b,c` · `rename <old> <new>` | auto mode, priority chain, rename (logins kept) |
 | `seat list` · `doctor` · `remove <name> [--purge]` | manage seats |
-| `SEAT_AUTO=0` · `SEAT_ASK=0` · `SEAT_PROMPT=0` | menu + confirm / no seat choice / no prompt tag |
+| `SEAT_AUTO=0/1` · `SEAT_ASK=0` · `SEAT_PROMPT=0` | override auto mode / no seat choice / no prompt tag |
 
 ## How it works
 
@@ -75,8 +75,9 @@ Config: `~/.config/seat/config.json`.
 
 ## About automatic switching
 
-Switching is automatic by default, but only when a session ends, never mid-request, and only
-between seats allowed for the project (or the same group). Keep in mind:
+Off by default; `seat auto on` turns it on. Even then it switches only when a session ends,
+never mid-request, and only between seats allowed for the project (or the same group).
+Keep in mind:
 
 - Rotating accounts to get around usage limits is a gray area under Anthropic's terms at
   best, and the account risk lands on you (and on your company for Team seats).

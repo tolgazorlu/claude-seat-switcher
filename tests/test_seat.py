@@ -208,6 +208,7 @@ class SeatTest(unittest.TestCase):
         for n in ("viby", "viby2", "viby3"):
             self.login_claude(n)
         run(self.seat, self.seat.cmd_order, "viby3,viby,viby2")
+        run(self.seat, self.seat.cmd_auto, "on")
         os.environ["SEAT_ACCOUNT"] = "viby3"
         self.write_transcript(self.home / ".claude-viby3", [{"type": "assistant", "message": {}}])
         self.set_usage("viby3", 96)            # near the limit counts as full
@@ -222,7 +223,8 @@ class SeatTest(unittest.TestCase):
     def test_after_asks_when_auto_is_off(self):
         for n in ("viby", "viby2"):
             self.login_claude(n)
-        os.environ.update({"SEAT_ACCOUNT": "viby", "SEAT_AUTO": "0"})
+        run(self.seat, self.seat.cmd_auto, "on")
+        os.environ.update({"SEAT_ACCOUNT": "viby", "SEAT_AUTO": "0"})   # per-terminal override
         self.write_transcript(self.home / ".claude-viby", [{"type": "assistant", "message": {}}])
         self.set_usage("viby", 100)
         self.set_usage("viby2", 0)
@@ -235,6 +237,7 @@ class SeatTest(unittest.TestCase):
         for n in ("viby", "viby2"):
             self.login_claude(n)
         run(self.seat, self.seat.cmd_remove, "max")
+        run(self.seat, self.seat.cmd_auto, "on")
         self.set_usage("viby", 97)
         self.set_usage("viby2", 10)
         self.seat.pick = lambda *a, **k: self.fail("auto mode must not show a menu")
@@ -245,6 +248,14 @@ class SeatTest(unittest.TestCase):
         self.assertIn(f"{self.home}/.claude-viby ", out + " ")
         os.environ["SEAT_PIN"] = "viby2"       # seat use viby2 sticks while it has limit left
         self.assertIn(f"{self.home}/.claude-viby2", run(self.seat, self.seat.cmd_launch, "claude"))
+
+    def test_auto_is_off_by_default(self):
+        cfg = self.seat.Config()
+        self.assertFalse(self.seat.auto_mode(cfg))
+        self.assertFalse(self.seat.is_limited({"ts": time.time(), "five_hour": {"pct": 96, "resets": time.time() + 60}}))
+        run(self.seat, self.seat.cmd_auto, "on")
+        self.seat.Config()
+        self.assertTrue(self.seat.is_limited({"ts": time.time(), "five_hour": {"pct": 96, "resets": time.time() + 60}}))
 
     def test_order_and_rename(self):
         run(self.seat, self.seat.cmd_bind, "viby,viby2")
