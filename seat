@@ -567,6 +567,8 @@ def cmd_launch(cfg, args):
     rule = cfg.rule_for(cwd)
     if rule:
         allowed = cfg.allowed(cwd, cur)
+        if not allowed:
+            die(f"bu projenin hesapları gizli: seat bind <hesap> {rule['path']} veya seat init <ad>")
         usages = usage_for(allowed)
         good = [a for a in allowed if ready(a, tool) and not is_limited(usages.get(a.name))]
         choice = cur if cur in good else (good[0] if good else None)

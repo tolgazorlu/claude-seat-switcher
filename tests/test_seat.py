@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 def load_seat(home):
     os.environ.update({"HOME": str(home), "SEAT_OFFLINE": "1", "NO_COLOR": "1"})
     for k in ("SEAT_ACCOUNT", "CCS_ACCOUNT", "CLAUDE_CONFIG_DIR", "HERMES_HOME",
-              "SEAT_CONFIG_DIR", "SEAT_CACHE_DIR", "SEAT_HERMES_ROOT"):
+              "SEAT_CONFIG_DIR", "SEAT_CACHE_DIR", "SEAT_HERMES_ROOT",
+              "SEAT_AUTO", "SEAT_PIN", "SEAT_ASK", "SEAT_PROMPT"):
         os.environ.pop(k, None)
     loader = importlib.machinery.SourceFileLoader("seat_under_test", str(ROOT / "seat"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -101,6 +102,13 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(cfg.allowed(self.home, cfg.get("max")), [])
         run(self.seat, self.seat.cmd_init, "max")
         self.assertFalse(self.seat.Config().get("max").hidden)
+
+    def test_launch_in_project_bound_only_to_hidden_seat_exits_cleanly(self):
+        run(self.seat, self.seat.cmd_bind, "max", str(self.cwd))
+        run(self.seat, self.seat.cmd_remove, "max")
+        self.seat.pick = lambda *a, **k: self.fail("no menu for an empty seat list")
+        with self.assertRaises(SystemExit):
+            run(self.seat, self.seat.cmd_launch, "claude")
 
     def test_env_script(self):
         cfg = self.seat.Config()
