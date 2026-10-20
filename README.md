@@ -37,12 +37,14 @@ Update with `git -C ~/projects/hermes-seats pull`.
 
 ## Features
 
-- **Launch menu:** `claude` and `hermes` ask which seat, with live 5h / 7d limit bars.
+- **Priority order:** `seat order a,b,c` sets the chain. `claude` and `hermes` start on the
+  first seat with limit left (under 95% of the 5h and 7d windows); `seat use <name>` pins one.
 - **Project rules:** `seat bind work,work2` makes a folder use `work`; `cd` switches the terminal.
 - **Status line:** `work · Opus · 5s 23% · 7g 41%` inside Claude Code.
-- **Limit handoff:** when a seat runs out, it asks before moving to another allowed seat and
-  carries the session over. It never switches on its own, and never moves personal work
-  onto a company seat.
+- **Limit handoff:** when the session ends on a seat at 95% or more (or on a limit error),
+  `seat` moves to the next allowed seat in order without asking and resumes the same session.
+  It never moves personal work onto a company seat. `SEAT_AUTO=0` brings back the launch menu
+  and the confirm prompt.
 - **Isolation:** each extra seat has its own Claude config dir, Hermes profile and login.
   Company seats get their own Hermes memories and no personal Hermes API keys; Claude Code
   settings, hooks and skills stay shared.
@@ -54,8 +56,9 @@ Update with `git -C ~/projects/hermes-seats pull`.
 | `seat use <name>` | switch this terminal |
 | `seat bind a,b [dir]` · `unbind` · `projects` | project rules (first = default) |
 | `seat status` · `whoami` · `usage` | logins, current account, limit bars |
+| `seat order a,b,c` · `rename <old> <new>` | priority chain, rename (logins kept) |
 | `seat list` · `doctor` · `remove <name> [--purge]` | manage seats |
-| `SEAT_ASK=0` · `SEAT_PROMPT=0` | no launch menu / no prompt tag |
+| `SEAT_AUTO=0` · `SEAT_ASK=0` · `SEAT_PROMPT=0` | menu + confirm / no seat choice / no prompt tag |
 
 ## How it works
 
@@ -70,16 +73,14 @@ Config: `~/.config/seat/config.json`.
   ([terms](https://code.claude.com/docs/en/legal-and-compliance)). On company seats, give
   Hermes an API key or ask the company first.
 
-## Why no automatic switching?
+## About automatic switching
 
-Tools like claude-swap jump to another account on their own when one nears its limit.
-`seat` deliberately doesn't:
+Switching is automatic by default, but only when a session ends, never mid-request, and only
+between seats allowed for the project (or the same group). Keep in mind:
 
 - Rotating accounts to get around usage limits is a gray area under Anthropic's terms at
   best, and the account risk lands on you (and on your company for Team seats).
-- A silent switch can move personal work onto a company seat, or the other way around.
-- You should know which account is spending. So `seat` asks once, offers only seats allowed
-  for the project, and you confirm with one key.
+- The launch line (`seat ▸ name · email · 5s %..`) always shows which account is spending.
 
 Inspired by [clauth](https://github.com/uwuclxdy/clauth), [claude-code-account-switcher](https://github.com/Nemo-Illusionist/claude-code-account-switcher)
 and [cux](https://github.com/inulute/cux); no code copied. Tests: `python3 -m unittest discover -s tests`.
